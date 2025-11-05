@@ -1,4 +1,6 @@
-use crate::{cache::Cache, config::Config, db::Database, error::Result};
+use crate::{
+    cache::Cache, config::Config, db::Database, discord_client::AttachmentInfo, error::Result,
+};
 use http_body_util::{BodyExt, Full};
 use hyper::{Method, Request as HyperRequest, Uri, body::Bytes};
 use hyper_util::client::legacy::{Client, connect::HttpConnector};
@@ -397,5 +399,193 @@ impl MatrixClient {
         )
         .await?;
         Ok(())
+    }
+
+    pub async fn send_edit(
+        &self,
+        room_id: &str,
+        original_event_id: &str,
+        new_content: RoomMessageEventContent,
+        mxid: Option<&str>,
+    ) -> Result<String> {
+        // Serialize the new content
+        let mut content_json = serde_json::to_value(&new_content)?;
+
+        // Add m.new_content field with the actual new content
+        let new_content_body = content_json.clone();
+        content_json["m.new_content"] = new_content_body;
+
+        // Add m.relates_to for the edit relationship
+        content_json["m.relates_to"] = json!({
+            "rel_type": "m.replace",
+            "event_id": original_event_id
+        });
+
+        // The body should indicate this is an edit with fallback text
+        // for clients that don't support edits
+        if let Some(body) = content_json["body"].as_str() {
+            content_json["body"] = json!(format!("* {}", body));
+        }
+        if let Some(formatted_body) = content_json["formatted_body"].as_str() {
+            content_json["formatted_body"] = json!(format!("* {}", formatted_body));
+        }
+
+        let txn_id = uuid::Uuid::new_v4();
+        let resp = self
+            .send_request(
+                Method::PUT,
+                &format!(
+                    "/rooms/{}/send/m.room.message/{}",
+                    urlencoding::encode(room_id),
+                    txn_id
+                ),
+                Some(content_json),
+                mxid,
+            )
+            .await?;
+
+        Ok(resp["event_id"].as_str().unwrap().to_string())
+    }
+
+    pub async fn send_reaction(
+        &self,
+        room_id: &str,
+        event_id: &str,
+        reaction_key: &str,
+        mxid: &str,
+    ) -> Result<String> {
+        let content = json!({
+            "m.relates_to": {
+                "rel_type": "m.annotation",
+                "event_id": event_id,
+                "key": reaction_key
+            }
+        });
+
+        let txn_id = uuid::Uuid::new_v4();
+        let resp = self
+            .send_request(
+                Method::PUT,
+                &format!(
+                    "/rooms/{}/send/m.reaction/{}",
+                    urlencoding::encode(room_id),
+                    txn_id
+                ),
+                Some(content),
+                Some(mxid),
+            )
+            .await?;
+
+        Ok(resp["event_id"].as_str().unwrap().to_string())
+    }
+    pub async fn send_media(
+        &self,
+        room_id: &str,
+        mxid: &str,
+        attachment: &AttachmentInfo,
+    ) -> Result<String> {
+        // Download the attachment
+        let uri: Uri = attachment.url.parse().unwrap();
+        let req = HyperRequest::builder()
+            .uri(uri)
+            .body(Full::new(Bytes::new()))
+            .unwrap();
+
+        let res = self.http_client.request(req).await?;
+        let bytes = res.collect().await?.to_bytes();
+
+        // Upload to homeserver
+        let upload_url = format!("{}/_matrix/media/r0/upload", self.config.homeserver);
+
+        let mut upload_req = HyperRequest::builder()
+            .method(Method::POST)
+            .uri(upload_url)
+            .header("Authorization", format!("Bearer {}", self.config.as_token));
+
+        // Set content type if available
+        if let Some(ref content_type) = attachment.content_type {
+            upload_req = upload_req.header("Content-Type", content_type);
+        } else {
+            upload_req = upload_req.header("Content-Type", "application/octet-stream");
+        }
+
+        let upload_req = upload_req.body(Full::new(bytes.clone())).unwrap();
+
+        let res = self.http_client.request(upload_req).await?;
+        let body = res.collect().await?.to_bytes();
+        let upload_resp: Value = serde_json::from_slice(&body)?;
+        let mxc_url = upload_resp["content_uri"].as_str().unwrap();
+
+        // Determine message type based on content type
+        let (msgtype, extra_info) = self.determine_media_type(attachment, mxc_url, bytes.len());
+
+        let content = json!({
+            "msgtype": msgtype,
+            "body": attachment.filename,
+            "url": mxc_url,
+            "info": extra_info
+        });
+
+        let txn_id = uuid::Uuid::new_v4();
+        let resp = self
+            .send_request(
+                Method::PUT,
+                &format!(
+                    "/rooms/{}/send/m.room.message/{}",
+                    urlencoding::encode(room_id),
+                    txn_id
+                ),
+                Some(content),
+                Some(mxid),
+            )
+            .await?;
+
+        Ok(resp["event_id"].as_str().unwrap().to_string())
+    }
+
+    fn determine_media_type(
+        &self,
+        attachment: &AttachmentInfo,
+        mxc_url: &str,
+        size: usize,
+    ) -> (String, Value) {
+        let content_type = attachment
+            .content_type
+            .as_deref()
+            .unwrap_or("application/octet-stream");
+
+        let mut info = json!({
+            "size": size,
+            "mimetype": content_type
+        });
+
+        let msgtype = if content_type.starts_with("image/") {
+            if let (Some(w), Some(h)) = (attachment.width, attachment.height) {
+                info["w"] = json!(w);
+                info["h"] = json!(h);
+
+                // Generate thumbnail URL (same as original for now)
+                info["thumbnail_url"] = json!(mxc_url);
+                info["thumbnail_info"] = json!({
+                    "mimetype": content_type,
+                    "size": size,
+                    "w": w,
+                    "h": h
+                });
+            }
+            "m.image"
+        } else if content_type.starts_with("video/") {
+            if let (Some(w), Some(h)) = (attachment.width, attachment.height) {
+                info["w"] = json!(w);
+                info["h"] = json!(h);
+            }
+            "m.video"
+        } else if content_type.starts_with("audio/") {
+            "m.audio"
+        } else {
+            "m.file"
+        };
+
+        (msgtype.to_string(), info)
     }
 }
