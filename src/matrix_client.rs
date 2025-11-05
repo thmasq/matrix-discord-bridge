@@ -588,4 +588,43 @@ impl MatrixClient {
 
         (msgtype.to_string(), info)
     }
+
+    pub async fn download_media(&self, mxc_url: &str) -> Result<Vec<u8>> {
+        if !mxc_url.starts_with("mxc://") {
+            return Err(crate::error::BridgeError::Matrix(
+                "Invalid MXC URL".to_string(),
+            ));
+        }
+
+        let parts: Vec<&str> = mxc_url.trim_start_matches("mxc://").split('/').collect();
+        if parts.len() != 2 {
+            return Err(crate::error::BridgeError::Matrix(
+                "Invalid MXC URL format".to_string(),
+            ));
+        }
+
+        let download_url = format!(
+            "{}/_matrix/media/r0/download/{}/{}",
+            self.config.homeserver, parts[0], parts[1]
+        );
+
+        let uri: Uri = download_url.parse().unwrap();
+        let req = HyperRequest::builder()
+            .uri(uri)
+            .header("Authorization", format!("Bearer {}", self.config.as_token))
+            .body(Full::new(Bytes::new()))
+            .unwrap();
+
+        let res = self.http_client.request(req).await?;
+
+        if res.status() != hyper::StatusCode::OK {
+            return Err(crate::error::BridgeError::Matrix(format!(
+                "Failed to download media: {}",
+                res.status()
+            )));
+        }
+
+        let bytes = res.collect().await?.to_bytes();
+        Ok(bytes.to_vec())
+    }
 }

@@ -153,6 +153,8 @@ impl AppService {
             "m.room.member" => self.handle_member_event(event).await,
             "m.room.message" => self.handle_message_event(event).await,
             "m.room.redaction" => self.handle_redaction_event(event).await,
+            "m.reaction" => self.handle_reaction_event(event).await,
+            "m.typing" => self.handle_typing_event(event).await,
             _ => {
                 tracing::debug!("Unhandled event type: {}", event_type);
                 Ok(())
@@ -186,16 +188,20 @@ impl AppService {
         let sender = event["sender"].as_str().unwrap();
         let event_id = event["event_id"].as_str().unwrap();
         let content = &event["content"];
-        let body = content["body"].as_str().unwrap_or("");
 
         // Ignore our own messages (bot and puppet users)
         if sender.starts_with("@_discord_") || sender == self.config.full_user_id() {
             return Ok(());
         }
 
+        let msgtype = content["msgtype"].as_str().unwrap_or("m.text");
+
         // Handle bridge commands
-        if body.starts_with("!bridge ") {
-            return self.handle_bridge_command(room_id, sender, body).await;
+        if msgtype == "m.text" {
+            let body = content["body"].as_str().unwrap_or("");
+            if body.starts_with("!bridge ") {
+                return self.handle_bridge_command(room_id, sender, body).await;
+            }
         }
 
         // Check if this is an edit
@@ -212,7 +218,14 @@ impl AppService {
         // Check if room is bridged
         if let Some(channel_id) = self.db.get_channel(room_id).await? {
             return self
-                .forward_to_discord(room_id, sender, event_id, content, &channel_id)
+                .forward_message_to_discord(
+                    room_id,
+                    sender,
+                    event_id,
+                    content,
+                    &channel_id,
+                    msgtype,
+                )
                 .await;
         }
 
@@ -351,7 +364,35 @@ impl AppService {
         })
     }
 
-    async fn forward_to_discord(
+    async fn forward_message_to_discord(
+        &self,
+        room_id: &str,
+        sender: &str,
+        event_id: &str,
+        content: &Value,
+        channel_id: &str,
+        msgtype: &str,
+    ) -> crate::error::Result<()> {
+        // Handle different message types
+        match msgtype {
+            "m.text" | "m.notice" | "m.emote" => {
+                self.forward_text_to_discord(room_id, sender, event_id, content, channel_id)
+                    .await
+            }
+            "m.image" | "m.file" | "m.video" | "m.audio" => {
+                self.forward_media_to_discord(
+                    room_id, sender, event_id, content, channel_id, msgtype,
+                )
+                .await
+            }
+            _ => {
+                tracing::debug!("Unhandled message type: {}", msgtype);
+                Ok(())
+            }
+        }
+    }
+
+    async fn forward_text_to_discord(
         &self,
         room_id: &str,
         sender: &str,
@@ -424,6 +465,73 @@ impl AppService {
                 &processed_body,
                 display_name,
                 avatar_url.as_deref(),
+                None,
+            )
+            .await?;
+
+        // Cache the mapping
+        self.cache
+            .m_messages
+            .write()
+            .insert(event_id.to_string(), discord_msg_id.clone());
+        self.cache
+            .d_messages
+            .write()
+            .insert(discord_msg_id, event_id.to_string());
+
+        Ok(())
+    }
+
+    async fn forward_media_to_discord(
+        &self,
+        room_id: &str,
+        sender: &str,
+        event_id: &str,
+        content: &Value,
+        channel_id: &str,
+        msgtype: &str,
+    ) -> crate::error::Result<()> {
+        let url = content["url"]
+            .as_str()
+            .ok_or_else(|| BridgeError::Matrix("Media message missing url field".to_string()))?;
+
+        let body = content["body"].as_str().unwrap_or("attachment");
+
+        // Download from Matrix
+        let media_data = self.matrix.download_media(url).await?;
+
+        // Get member info
+        let members = self.get_room_members(room_id).await?;
+        let member = members.get(sender);
+
+        let display_name = member
+            .and_then(|m| m.display_name.as_ref())
+            .map(|s| s.as_str())
+            .unwrap_or_else(|| sender.split(':').next().unwrap_or(sender));
+
+        let avatar_url = member
+            .and_then(|m| m.avatar_url.as_ref())
+            .and_then(|mxc| self.matrix.mxc_to_http(mxc));
+
+        tracing::info!(
+            "Forwarding {} from {} to Discord channel {}",
+            msgtype,
+            sender,
+            channel_id
+        );
+
+        // Get webhook
+        let webhook = self.get_or_create_webhook(channel_id).await?;
+
+        // Upload to Discord and send
+        let discord_msg_id = self
+            .send_webhook_with_file(
+                &webhook,
+                body,
+                display_name,
+                avatar_url.as_deref(),
+                body,
+                &media_data,
             )
             .await?;
 
@@ -625,6 +733,179 @@ impl AppService {
         Ok(())
     }
 
+    async fn handle_reaction_event(&self, event: &Value) -> crate::error::Result<()> {
+        let room_id = event["room_id"].as_str().unwrap();
+        let sender = event["sender"].as_str().unwrap();
+        let event_id = event["event_id"].as_str().unwrap();
+        let content = &event["content"];
+
+        // Ignore reactions from Discord puppet users
+        if sender.starts_with("@_discord_") {
+            return Ok(());
+        }
+
+        // Get the related event
+        let relates_to = content
+            .get("m.relates_to")
+            .ok_or_else(|| BridgeError::Matrix("Reaction missing m.relates_to".to_string()))?;
+
+        let target_event_id = relates_to["event_id"]
+            .as_str()
+            .ok_or_else(|| BridgeError::Matrix("Reaction missing event_id".to_string()))?;
+
+        let reaction_key = relates_to["key"]
+            .as_str()
+            .ok_or_else(|| BridgeError::Matrix("Reaction missing key".to_string()))?;
+
+        // Find the Discord message ID
+        let discord_msg_id = {
+            let messages = self.cache.m_messages.read();
+            messages.get(target_event_id).cloned()
+        };
+
+        let discord_msg_id = match discord_msg_id {
+            Some(id) => id,
+            None => {
+                tracing::debug!("No Discord message found for reaction");
+                return Ok(());
+            }
+        };
+
+        // Get channel ID
+        let channel_id = self
+            .db
+            .get_channel(room_id)
+            .await?
+            .ok_or_else(|| BridgeError::NotFound)?;
+
+        // Convert Matrix reaction to Discord emoji
+        // For custom emojis in :name: format, look them up in cache
+        let discord_emoji = if reaction_key.starts_with(':') && reaction_key.ends_with(':') {
+            let name = reaction_key.trim_matches(':');
+            let emotes = self.cache.d_emotes.read();
+
+            // Extract just the emoji ID from the Discord format
+            if let Some(discord_format) = emotes.get(name) {
+                // Discord format is <:name:id> or <a:name:id>
+                let id_regex = regex::Regex::new(r":(\d+)>$").unwrap();
+                if let Some(cap) = id_regex.captures(discord_format) {
+                    format!("{}:{}", name, cap.get(1).unwrap().as_str())
+                } else {
+                    // Fallback to Unicode
+                    urlencoding::encode(reaction_key).to_string()
+                }
+            } else {
+                // Not found, might be a Unicode emoji represented as :name:
+                urlencoding::encode(reaction_key).to_string()
+            }
+        } else {
+            // Unicode emoji
+            urlencoding::encode(reaction_key).to_string()
+        };
+
+        tracing::info!(
+            "Adding reaction {} to Discord message {}",
+            discord_emoji,
+            discord_msg_id
+        );
+
+        // Add reaction via Discord API
+        let url = format!(
+            "https://discord.com/api/v10/channels/{}/messages/{}/reactions/{}/@me",
+            channel_id, discord_msg_id, discord_emoji
+        );
+
+        let response = self
+            .discord_http
+            .put(&url)
+            .header(
+                "Authorization",
+                format!("Bot {}", self.config.discord_token),
+            )
+            .send()
+            .await
+            .map_err(|e| {
+                BridgeError::Discord(serenity::Error::from(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    e.to_string(),
+                )))
+            })?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let error_text = response.text().await.unwrap_or_default();
+            tracing::error!("Failed to add Discord reaction {}: {}", status, error_text);
+            return Err(BridgeError::Discord(serenity::Error::from(
+                std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    format!("Discord reaction failed: {}", status),
+                ),
+            )));
+        }
+
+        // Cache the reaction mapping for removal
+        let cache_key = format!("{}:{}:{}", discord_msg_id, sender, reaction_key);
+        self.cache
+            .m_messages
+            .write()
+            .insert(cache_key, event_id.to_string());
+
+        Ok(())
+    }
+
+    async fn handle_typing_event(&self, event: &Value) -> crate::error::Result<()> {
+        let room_id = event["room_id"].as_str().unwrap_or("");
+        let content = &event["content"];
+
+        let user_ids = content["user_ids"]
+            .as_array()
+            .ok_or_else(|| BridgeError::Matrix("Typing event missing user_ids".to_string()))?;
+
+        // Check if room is bridged
+        let channel_id = match self.db.get_channel(room_id).await? {
+            Some(id) => id,
+            None => return Ok(()), // Not bridged, ignore
+        };
+
+        // Process typing indicators
+        for user_id in user_ids {
+            if let Some(uid) = user_id.as_str() {
+                // Ignore Discord puppet users
+                if uid.starts_with("@_discord_") || uid == self.config.full_user_id() {
+                    continue;
+                }
+
+                tracing::debug!("User {} is typing in room {}", uid, room_id);
+
+                // Note: Discord doesn't have a direct typing indicator API that bots can trigger
+                // via webhooks. The typing indicator is only available for bot users posting
+                // directly, not through webhooks. We could trigger it but it would appear
+                // as the bot, not as the bridged user. For now, we'll just log it.
+                // In a full implementation, you might want to:
+                // 1. Use the bot to send typing via POST /channels/{channel_id}/typing
+                // 2. But this would show as the bot, not the user
+                // This is a limitation of Discord's API with webhooks.
+
+                let url = format!("https://discord.com/api/v10/channels/{}/typing", channel_id);
+
+                if let Err(e) = self
+                    .discord_http
+                    .post(&url)
+                    .header(
+                        "Authorization",
+                        format!("Bot {}", self.config.discord_token),
+                    )
+                    .send()
+                    .await
+                {
+                    tracing::debug!("Failed to send typing indicator: {}", e);
+                }
+            }
+        }
+
+        Ok(())
+    }
+
     async fn get_or_create_webhook(&self, channel_id: &str) -> crate::error::Result<WebhookData> {
         // Check cache first
         {
@@ -746,17 +1027,22 @@ impl AppService {
         content: &str,
         username: &str,
         avatar_url: Option<&str>,
+        thread_id: Option<&str>,
     ) -> crate::error::Result<String> {
-        let url = format!(
+        let mut url = format!(
             "https://discord.com/api/v10/webhooks/{}/{}?wait=true",
             webhook.id, webhook.token
         );
+
+        if let Some(tid) = thread_id {
+            url.push_str(&format!("&thread_id={}", tid));
+        }
 
         let mut body = json!({
             "content": content,
             "username": username,
             "allowed_mentions": {
-                "parse": ["users"]
+                "parse": ["users", "roles"]
             }
         });
 
@@ -780,6 +1066,59 @@ impl AppService {
                 std::io::Error::new(
                     std::io::ErrorKind::Other,
                     format!("Webhook send failed {}: {}", status, error_text),
+                ),
+            )));
+        }
+
+        let message: Value = response
+            .json()
+            .await
+            .map_err(|e| BridgeError::Matrix(format!("Failed to parse webhook response: {}", e)))?;
+
+        Ok(message["id"].as_str().unwrap().to_string())
+    }
+
+    async fn send_webhook_with_file(
+        &self,
+        webhook: &WebhookData,
+        content: &str,
+        username: &str,
+        avatar_url: Option<&str>,
+        filename: &str,
+        file_data: &[u8],
+    ) -> crate::error::Result<String> {
+        let url = format!(
+            "https://discord.com/api/v10/webhooks/{}/{}?wait=true",
+            webhook.id, webhook.token
+        );
+
+        // Build multipart form
+        let form = reqwest::multipart::Form::new()
+            .text("username", username.to_string())
+            .text("content", content.to_string())
+            .part(
+                "file",
+                reqwest::multipart::Part::bytes(file_data.to_vec()).file_name(filename.to_string()),
+            );
+
+        let mut request = self.discord_http.post(&url).multipart(form);
+
+        if let Some(avatar) = avatar_url {
+            request = request.header("X-Avatar-URL", avatar);
+        }
+
+        let response = request
+            .send()
+            .await
+            .map_err(|e| BridgeError::Matrix(format!("Failed to send webhook with file: {}", e)))?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let error_text = response.text().await.unwrap_or_default();
+            return Err(BridgeError::Discord(serenity::Error::from(
+                std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    format!("Webhook file send failed {}: {}", status, error_text),
                 ),
             )));
         }
