@@ -627,4 +627,133 @@ impl MatrixClient {
         let bytes = res.collect().await?.to_bytes();
         Ok(bytes.to_vec())
     }
+
+    /// Fetch custom emoji (image packs) for a room
+    /// Supports MSC2545 (im.ponies.emote_rooms) used by Nheko, Cinny, etc.
+    pub async fn fetch_room_emojis(&self, room_id: &str) -> Result<HashMap<String, String>> {
+        let mut emojis = HashMap::new();
+
+        // Try to get im.ponies.emote_rooms state event
+        let resp = self
+            .send_request(
+                Method::GET,
+                &format!(
+                    "/rooms/{}/state/im.ponies.emote_rooms",
+                    urlencoding::encode(room_id)
+                ),
+                None,
+                None,
+            )
+            .await;
+
+        if let Ok(state_event) = resp {
+            // Parse the emote rooms
+            if let Some(rooms) = state_event["rooms"].as_object() {
+                for (_room_key, room_data) in rooms {
+                    if let Some(images) = room_data["images"].as_object() {
+                        for (shortcode, image_data) in images {
+                            if let Some(url) = image_data["url"].as_str() {
+                                emojis.insert(shortcode.clone(), url.to_string());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Also try im.ponies.room_emotes (alternative format)
+        let resp = self
+            .send_request(
+                Method::GET,
+                &format!(
+                    "/rooms/{}/state/im.ponies.room_emotes",
+                    urlencoding::encode(room_id)
+                ),
+                None,
+                None,
+            )
+            .await;
+
+        if let Ok(state_event) = resp {
+            if let Some(images) = state_event["images"].as_object() {
+                for (shortcode, image_data) in images {
+                    if let Some(url) = image_data["url"].as_str() {
+                        emojis.insert(shortcode.clone(), url.to_string());
+                    }
+                }
+            }
+        }
+
+        // Cache the results
+        if !emojis.is_empty() {
+            self.cache
+                .m_custom_emojis
+                .write()
+                .insert(room_id.to_string(), emojis.clone());
+        }
+
+        Ok(emojis)
+    }
+
+    /// Parse Matrix message and extract custom emoji usage
+    /// Returns emoji_map where emoji_map is shortcode -> MXC URL
+    pub fn parse_matrix_emojis(
+        &self,
+        body: &str,
+        formatted_body: Option<&str>,
+    ) -> HashMap<String, String> {
+        let mut emojis = HashMap::new();
+
+        // Parse HTML formatted body for <img data-mx-emoticon> tags
+        if let Some(html) = formatted_body {
+            let img_regex = regex::Regex::new(
+                r#"<img[^>]*data-mx-emoticon[^>]*src="(mxc://[^"]+)"[^>]*(?:alt|title)=":([^:"]+):"[^>]*/?>"#
+            ).unwrap();
+
+            for cap in img_regex.captures_iter(html) {
+                if let (Some(mxc_url), Some(shortcode)) = (cap.get(1), cap.get(2)) {
+                    emojis.insert(shortcode.as_str().to_string(), mxc_url.as_str().to_string());
+                }
+            }
+
+            // Also try reversed order (title before src)
+            let img_regex_alt = regex::Regex::new(
+                r#"<img[^>]*(?:alt|title)=":([^:"]+):"[^>]*data-mx-emoticon[^>]*src="(mxc://[^"]+)"[^>]*/?>"#
+            ).unwrap();
+
+            for cap in img_regex_alt.captures_iter(html) {
+                if let (Some(shortcode), Some(mxc_url)) = (cap.get(1), cap.get(2)) {
+                    emojis.insert(shortcode.as_str().to_string(), mxc_url.as_str().to_string());
+                }
+            }
+        }
+
+        // If no HTML, look for :shortcode: patterns in plain text
+        if emojis.is_empty() {
+            let shortcode_regex = regex::Regex::new(r":([a-zA-Z0-9_-]+):").unwrap();
+            for cap in shortcode_regex.captures_iter(body) {
+                if let Some(shortcode) = cap.get(1) {
+                    // Mark it as found but without MXC URL
+                    // We'll need to look it up from room emojis
+                    emojis.insert(shortcode.as_str().to_string(), String::new());
+                }
+            }
+        }
+
+        emojis
+    }
+
+    /// Get cached custom emojis for a room, or fetch if not cached
+    pub async fn get_room_emojis(&self, room_id: &str) -> Result<HashMap<String, String>> {
+        // Check cache first
+        {
+            let cache = self.cache.m_custom_emojis.read();
+            if let Some(emojis) = cache.get(room_id) {
+                return Ok(emojis.clone());
+            }
+        }
+
+        // Fetch and cache
+        self.fetch_room_emojis(room_id).await
+    }
 }

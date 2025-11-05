@@ -339,14 +339,101 @@ impl DiscordHandler {
         false
     }
 
-    async fn create_matrix_message_content(
+    async fn send_attachments_to_matrix(
         &self,
+        room_id: &str,
+        mxid: &str,
+        attachments: Vec<AttachmentInfo>,
+    ) -> crate::error::Result<Vec<String>> {
+        let mut event_ids = Vec::new();
+
+        for attachment in attachments {
+            match self.matrix.send_media(room_id, mxid, &attachment).await {
+                Ok(event_id) => {
+                    tracing::info!(
+                        "Sent attachment {} to Matrix as {}",
+                        attachment.filename,
+                        event_id
+                    );
+                    event_ids.push(event_id);
+                }
+                Err(e) => {
+                    tracing::error!("Failed to send attachment {}: {}", attachment.filename, e);
+                    // Continue with other attachments
+                }
+            }
+        }
+
+        Ok(event_ids)
+    }
+
+    async fn create_matrix_message_content_with_emojis(
+        &self,
+        room_id: &str,
         content: &str,
-        emotes: &HashMap<String, String>,
+        discord_emotes: &HashMap<String, String>,
         reply_to_event_id: Option<String>,
     ) -> RoomMessageEventContent {
+        // Get Matrix room's custom emojis
+        let room_emojis = self
+            .matrix
+            .get_room_emojis(room_id)
+            .await
+            .unwrap_or_default();
+
+        // Build a map of matched emojis (name -> MXC URL)
+        let mut matched_emojis = HashMap::new();
+
+        for (emote_name, discord_id) in discord_emotes {
+            // Check if Matrix room has a custom emoji with the same name
+            if let Some(mxc_url) = room_emojis.get(emote_name) {
+                // Found a match! Use the Matrix custom emoji
+                matched_emojis.insert(emote_name.clone(), mxc_url.clone());
+                tracing::debug!(
+                    "Matched Discord emoji :{}: to Matrix emoji {}",
+                    emote_name,
+                    mxc_url
+                );
+            } else {
+                // No match - will need to upload from Discord
+                let discord_url = format!("https://cdn.discordapp.com/emojis/{}.png", discord_id);
+
+                // Check if we've already uploaded this emoji
+                let cached_mxc = {
+                    let cache = self.cache.m_emotes.read();
+                    cache.get(emote_name).cloned()
+                };
+
+                if let Some(mxc) = cached_mxc {
+                    matched_emojis.insert(emote_name.clone(), mxc);
+                } else {
+                    // Upload the Discord emoji to Matrix
+                    match self.matrix.upload_from_url(&discord_url).await {
+                        Ok(mxc_url) => {
+                            self.cache
+                                .m_emotes
+                                .write()
+                                .insert(emote_name.clone(), mxc_url.clone());
+                            matched_emojis.insert(emote_name.clone(), mxc_url);
+                            tracing::debug!(
+                                "Uploaded Discord emoji :{}: to Matrix as {}",
+                                emote_name,
+                                matched_emojis.get(emote_name).unwrap()
+                            );
+                        }
+                        Err(e) => {
+                            tracing::warn!("Failed to upload Discord emoji {}: {}", emote_name, e);
+                        }
+                    }
+                }
+            }
+        }
+
         // Process markdown and emotes
-        let (plain_body, formatted_body) = self.matrix.process_for_matrix(content, emotes).await;
+        let (plain_body, formatted_body) = self
+            .matrix
+            .process_for_matrix(content, &matched_emojis)
+            .await;
 
         if let Some(event_id) = reply_to_event_id {
             let reply_fallback_plain = format!("> In reply to {}\n\n{}", event_id, plain_body);
@@ -403,34 +490,6 @@ impl DiscordHandler {
                 RoomMessageEventContent::text_plain(plain_body)
             }
         }
-    }
-
-    async fn send_attachments_to_matrix(
-        &self,
-        room_id: &str,
-        mxid: &str,
-        attachments: Vec<AttachmentInfo>,
-    ) -> crate::error::Result<Vec<String>> {
-        let mut event_ids = Vec::new();
-
-        for attachment in attachments {
-            match self.matrix.send_media(room_id, mxid, &attachment).await {
-                Ok(event_id) => {
-                    tracing::info!(
-                        "Sent attachment {} to Matrix as {}",
-                        attachment.filename,
-                        event_id
-                    );
-                    event_ids.push(event_id);
-                }
-                Err(e) => {
-                    tracing::error!("Failed to send attachment {}: {}", attachment.filename, e);
-                    // Continue with other attachments
-                }
-            }
-        }
-
-        Ok(event_ids)
     }
 }
 
@@ -590,7 +649,12 @@ impl EventHandler for DiscordHandler {
         let mut message_event_id = None;
         if !content.trim().is_empty() {
             let msg_content = self
-                .create_matrix_message_content(&content, &emotes, reply_to_event_id)
+                .create_matrix_message_content_with_emojis(
+                    &room_id,
+                    &content,
+                    &emotes,
+                    reply_to_event_id,
+                )
                 .await;
 
             match self

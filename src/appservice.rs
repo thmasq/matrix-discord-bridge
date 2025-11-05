@@ -1,5 +1,6 @@
 use crate::{
     cache::Cache, config::Config, db::Database, error::BridgeError, matrix_client::MatrixClient,
+    utils::DISCORD_MESSAGE_LIMIT,
 };
 use http_body_util::{BodyExt, Full};
 use hyper::{
@@ -155,6 +156,9 @@ impl AppService {
             "m.room.redaction" => self.handle_redaction_event(event).await,
             "m.reaction" => self.handle_reaction_event(event).await,
             "m.typing" => self.handle_typing_event(event).await,
+            "im.ponies.emote_rooms" | "im.ponies.room_emotes" => {
+                self.handle_emoji_update(event).await
+            }
             _ => {
                 tracing::debug!("Unhandled event type: {}", event_type);
                 Ok(())
@@ -232,6 +236,27 @@ impl AppService {
         Ok(())
     }
 
+    async fn handle_emoji_update(&self, event: &Value) -> crate::error::Result<()> {
+        let room_id = event["room_id"].as_str().unwrap();
+
+        tracing::info!("Emoji pack updated in room {}, refreshing cache", room_id);
+
+        // Clear the cache for this room
+        self.cache.m_custom_emojis.write().remove(room_id);
+
+        // Fetch fresh emoji data
+        match self.matrix.fetch_room_emojis(room_id).await {
+            Ok(emojis) => {
+                tracing::info!("Cached {} custom emojis for room {}", emojis.len(), room_id);
+            }
+            Err(e) => {
+                tracing::warn!("Failed to refresh emojis for room {}: {}", room_id, e);
+            }
+        }
+
+        Ok(())
+    }
+
     async fn handle_bridge_command(
         &self,
         room_id: &str,
@@ -285,7 +310,20 @@ impl AppService {
                     .write()
                     .insert(room_alias, room_id.to_string());
 
-                // Send confirmation message
+                // Prefetch custom emojis for the room
+                match self.matrix.fetch_room_emojis(room_id).await {
+                    Ok(emojis) => {
+                        tracing::info!(
+                            "Prefetched {} custom emojis for room {}",
+                            emojis.len(),
+                            room_id
+                        );
+                    }
+                    Err(e) => {
+                        tracing::warn!("Failed to prefetch emojis: {}", e);
+                    }
+                }
+
                 let content = RoomMessageEventContent::text_plain(&format!(
                     "✓ Room successfully bridged to Discord channel #{} ({})",
                     channel_info.name, channel_id
@@ -403,6 +441,17 @@ impl AppService {
         let body = content["body"].as_str().unwrap_or("");
         let formatted_body = content["formatted_body"].as_str();
 
+        // Parse custom emojis from the message
+        let matrix_emojis = self.matrix.parse_matrix_emojis(body, formatted_body);
+
+        // Get room's custom emojis and Discord emojis for matching
+        let room_emojis = self
+            .matrix
+            .get_room_emojis(room_id)
+            .await
+            .unwrap_or_default();
+        let discord_emojis = self.cache.d_emotes.read().clone();
+
         // Process the message for Discord
         let mut processed_body = body.to_string();
 
@@ -416,7 +465,36 @@ impl AppService {
             }
         }
 
-        // Handle Matrix emotes -> Discord emotes
+        // Handle Matrix custom emojis -> Discord emojis
+        // Try to match by name first, otherwise fall back to uploading
+        for (shortcode, mxc_url) in &matrix_emojis {
+            let emoji_pattern = format!(":{}:", shortcode);
+
+            // Check if there's a Discord emoji with the same name
+            if let Some(discord_format) = discord_emojis.get(shortcode) {
+                // Found a matching Discord emoji by name - use it directly
+                processed_body = processed_body.replace(&emoji_pattern, discord_format);
+                tracing::debug!("Matched Matrix emoji :{}: to Discord emoji", shortcode);
+            } else if !mxc_url.is_empty() {
+                // No match found - this would require uploading the image
+                // For now, just leave as :shortcode:
+                // In a full implementation, you could download and upload to Discord
+                tracing::debug!(
+                    "No Discord match for Matrix emoji :{}: ({})",
+                    shortcode,
+                    mxc_url
+                );
+            } else if let Some(room_mxc) = room_emojis.get(shortcode) {
+                // Found in room emojis but no Discord match
+                tracing::debug!(
+                    "Matrix emoji :{}: available in room ({}) but no Discord match",
+                    shortcode,
+                    room_mxc
+                );
+            }
+        }
+
+        // Fallback: Handle any remaining :name: patterns that might be Discord emojis
         {
             let emotes = self.cache.d_emotes.read();
             let emote_regex = regex::Regex::new(r":(\w+):").unwrap();
@@ -430,7 +508,6 @@ impl AppService {
         }
 
         // Truncate to Discord's message limit
-        const DISCORD_MESSAGE_LIMIT: usize = 2000;
         if processed_body.len() > DISCORD_MESSAGE_LIMIT {
             processed_body.truncate(DISCORD_MESSAGE_LIMIT);
             processed_body.push_str("…");
