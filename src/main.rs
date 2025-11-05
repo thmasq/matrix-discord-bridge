@@ -5,6 +5,7 @@ mod db;
 mod discord_client;
 mod error;
 mod matrix_client;
+mod utils;
 
 use crate::{
     appservice::AppService, cache::Cache, config::Config, db::Database,

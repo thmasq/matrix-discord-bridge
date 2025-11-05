@@ -2,13 +2,9 @@ use crate::{cache::Cache, config::Config, db::Database, error::Result};
 use http_body_util::{BodyExt, Full};
 use hyper::{Method, Request as HyperRequest, Uri, body::Bytes};
 use hyper_util::client::legacy::{Client, connect::HttpConnector};
-use ruma::{
-    OwnedRoomId, OwnedUserId, RoomAliasId, RoomId, UserId,
-    api::client::room::create_room::v3::Request as CreateRoomRequest,
-    events::room::message::RoomMessageEventContent,
-};
+use ruma::{OwnedRoomId, events::room::message::RoomMessageEventContent};
 use serde_json::{Value, json};
-use std::sync::Arc;
+use std::collections::HashMap;
 
 pub struct MatrixClient {
     config: Config,
@@ -120,7 +116,7 @@ impl MatrixClient {
         topic: &str,
         invitee: &str,
     ) -> Result<OwnedRoomId> {
-        let room_alias = format!("_discord_{}:{}", channel_id, self.config.server_name);
+        let _room_alias = format!("_discord_{}:{}", channel_id, self.config.server_name);
 
         let content = json!({
             "room_alias_name": format!("_discord_{}", channel_id),
@@ -258,5 +254,148 @@ impl MatrixClient {
             "#_discord_{}:{}",
             discord_channel_id, self.config.server_name
         )
+    }
+    pub async fn resolve_room_alias(&self, alias: &str) -> Result<String> {
+        // Check cache first
+        {
+            let rooms = self.cache.m_rooms.read();
+            if let Some(room_id) = rooms.get(alias) {
+                return Ok(room_id.clone());
+            }
+        }
+
+        // Query homeserver
+        let resp = self
+            .send_request(
+                Method::GET,
+                &format!("/directory/room/{}", urlencoding::encode(alias)),
+                None,
+                None,
+            )
+            .await?;
+
+        let room_id = resp["room_id"]
+            .as_str()
+            .ok_or_else(|| crate::error::BridgeError::Matrix("No room_id in response".into()))?
+            .to_string();
+
+        // Cache it
+        self.cache
+            .m_rooms
+            .write()
+            .insert(alias.to_string(), room_id.clone());
+
+        Ok(room_id)
+    }
+
+    pub async fn redact_event(
+        &self,
+        room_id: &str,
+        event_id: &str,
+        reason: Option<&str>,
+    ) -> Result<()> {
+        let txn_id = uuid::Uuid::new_v4();
+        let mut content = json!({});
+
+        if let Some(r) = reason {
+            content["reason"] = json!(r);
+        }
+
+        self.send_request(
+            Method::PUT,
+            &format!(
+                "/rooms/{}/redact/{}/{}",
+                urlencoding::encode(room_id),
+                urlencoding::encode(event_id),
+                txn_id
+            ),
+            Some(content),
+            None,
+        )
+        .await?;
+
+        Ok(())
+    }
+
+    pub async fn process_for_matrix(
+        &self,
+        message: &str,
+        emotes: &HashMap<String, String>,
+    ) -> (String, String) {
+        use pulldown_cmark::{Options, Parser, html};
+
+        // Convert markdown to HTML
+        let mut options = Options::empty();
+        options.insert(Options::ENABLE_STRIKETHROUGH);
+        options.insert(Options::ENABLE_TABLES);
+
+        let parser = Parser::new_ext(message, options);
+        let mut html_output = String::new();
+        html::push_html(&mut html_output, parser);
+
+        // Clean up HTML
+        let html_output = html_output
+            .trim_start_matches("<p>")
+            .trim_end_matches("</p>")
+            .replace("\n", "<br />");
+
+        // Process emotes
+        let mut formatted = html_output.clone();
+
+        for (emote_name, emote_id) in emotes {
+            let emote_url = format!("https://cdn.discordapp.com/emojis/{}.png", emote_id);
+
+            // Try to get from cache or upload
+            let mxc_url = {
+                let cache = self.cache.m_emotes.read();
+                cache.get(emote_name).cloned()
+            };
+
+            let mxc_url = if let Some(mxc) = mxc_url {
+                mxc
+            } else {
+                match self.upload_from_url(&emote_url).await {
+                    Ok(mxc) => {
+                        self.cache
+                            .m_emotes
+                            .write()
+                            .insert(emote_name.clone(), mxc.clone());
+                        mxc
+                    }
+                    Err(e) => {
+                        tracing::warn!("Failed to upload emote {}: {}", emote_name, e);
+                        continue;
+                    }
+                }
+            };
+
+            let emote_html = format!(
+                r#"<img alt=":{0}:" title=":{0}:" height="32" src="{1}" data-mx-emoticon />"#,
+                emote_name, mxc_url
+            );
+
+            formatted = formatted.replace(&format!(":{}:", emote_name), &emote_html);
+        }
+
+        // Return plain and formatted versions
+        (message.to_string(), formatted)
+    }
+
+    pub async fn send_typing(&self, room_id: &str, mxid: &str, timeout_ms: u32) -> Result<()> {
+        self.send_request(
+            Method::PUT,
+            &format!(
+                "/rooms/{}/typing/{}",
+                urlencoding::encode(room_id),
+                urlencoding::encode(mxid)
+            ),
+            Some(json!({
+                "typing": true,
+                "timeout": timeout_ms
+            })),
+            Some(mxid),
+        )
+        .await?;
+        Ok(())
     }
 }
