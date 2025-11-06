@@ -403,6 +403,32 @@ impl DiscordHandler {
         Ok(event_ids)
     }
 
+    fn strip_reply_fallback(&self, body: &str) -> String {
+        let mut result = String::new();
+        let mut in_fallback = true;
+
+        for line in body.lines() {
+            if !line.starts_with("> ") {
+                in_fallback = false;
+            }
+            if !in_fallback {
+                if !result.is_empty() {
+                    result.push('\n');
+                }
+                result.push_str(line);
+            }
+        }
+
+        result.trim().to_string()
+    }
+
+    /// Strip <mx-reply>...</mx-reply> tags from formatted HTML body
+    fn strip_reply_fallback_html(&self, html: &str) -> String {
+        // Use regex to strip <mx-reply>...</mx-reply> tags (with DOTALL flag)
+        let regex = regex::Regex::new(r"(?s)<mx-reply>.*?</mx-reply>").unwrap();
+        regex.replace_all(html, "").to_string()
+    }
+
     async fn create_matrix_message_content_with_emojis(
         &self,
         room_id: &str,
@@ -431,7 +457,7 @@ impl DiscordHandler {
                     mxc_url
                 );
             } else {
-                // No match - will need to upload from Discord
+                // Upload the Discord emoji to Matrix
                 let discord_url = format!("https://cdn.discordapp.com/emojis/{discord_id}.png");
 
                 // Check if we've already uploaded this emoji
@@ -472,8 +498,30 @@ impl DiscordHandler {
             .await;
 
         if let Some(event_id) = reply_to_event_id {
-            let reply_fallback_plain = format!("> In reply to {event_id}\n\n{plain_body}");
+            // Fetch the original event to strip fallbacks
+            let (reply_sender, reply_body, reply_formatted) =
+                match self.matrix.get_event(room_id, &event_id).await {
+                    Ok(event) => {
+                        let stripped_body = self.strip_reply_fallback(&event.body);
+                        let stripped_formatted = if let Some(fb) = event.formatted_body {
+                            self.strip_reply_fallback_html(&fb)
+                        } else {
+                            stripped_body.clone()
+                        };
+                        (event.sender, stripped_body, stripped_formatted)
+                    }
+                    Err(e) => {
+                        tracing::warn!("Failed to fetch event {} for reply: {}", event_id, e);
+                        // Fallback to simple reply without content preview
+                        ("unknown".to_string(), "...".to_string(), "...".to_string())
+                    }
+                };
 
+            // Create the reply fallback for plain text
+            let reply_fallback_plain =
+                format!("> <{}> {}\n\n{}", reply_sender, reply_body, plain_body);
+
+            // Escape HTML for the content if it's plain text
             let escape_html = |s: &str| -> String {
                 s.replace('&', "&amp;")
                     .replace('<', "&lt;")
@@ -488,9 +536,12 @@ impl DiscordHandler {
                 formatted_body.clone()
             };
 
+            // Create the reply fallback for HTML
             let reply_fallback_html = format!(
                 "<mx-reply><blockquote>\
-                <a href=\"https://matrix.to/#/{event_id}\">In reply to</a>\
+                <a href=\"https://matrix.to/#/{room_id}/{event_id}\">In reply to</a> \
+                <a href=\"https://matrix.to/#/{reply_sender}\">{reply_sender}</a>\
+                <br />{reply_formatted}\
                 </blockquote></mx-reply>{reply_content_html}"
             );
 

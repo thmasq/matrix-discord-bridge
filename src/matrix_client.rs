@@ -15,6 +15,15 @@ pub struct MatrixClient {
     cache: Cache,
 }
 
+#[derive(Debug, Clone)]
+pub struct MatrixEvent {
+    #[allow(dead_code)]
+    pub event_id: String,
+    pub sender: String,
+    pub body: String,
+    pub formatted_body: Option<String>,
+}
+
 impl MatrixClient {
     pub fn new(config: Config, db: Database, cache: Cache) -> Self {
         let http_client = Client::builder(hyper_util::rt::TokioExecutor::new()).build_http();
@@ -862,5 +871,30 @@ impl MatrixClient {
         } else {
             Ok(false)
         }
+    }
+
+    pub async fn get_event(&self, room_id: &str, event_id: &str) -> Result<MatrixEvent> {
+        let resp = self
+            .send_request(
+                Method::GET,
+                &format!(
+                    "/rooms/{}/event/{}",
+                    urlencoding::encode(room_id),
+                    urlencoding::encode(event_id)
+                ),
+                None,
+                None,
+            )
+            .await?;
+
+        let empty = serde_json::json!({});
+        let content = resp.get("content").unwrap_or(&empty);
+
+        Ok(MatrixEvent {
+            event_id: resp["event_id"].as_str().unwrap_or("").to_string(),
+            sender: resp["sender"].as_str().unwrap_or("").to_string(),
+            body: content["body"].as_str().unwrap_or("").to_string(),
+            formatted_body: content["formatted_body"].as_str().map(String::from),
+        })
     }
 }
