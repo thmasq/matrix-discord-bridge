@@ -246,7 +246,7 @@ impl MatrixClient {
         format!(
             "@_discord_{}{}:{}",
             discord_id,
-            hashed.map(|h| format!("-{}", h)).unwrap_or_default(),
+            hashed.map(|h| format!("-{h}")).unwrap_or_default(),
             self.config.server_name
         )
     }
@@ -339,13 +339,13 @@ impl MatrixClient {
         let html_output = html_output
             .trim_start_matches("<p>")
             .trim_end_matches("</p>")
-            .replace("\n", "<br />");
+            .replace('\n', "<br />");
 
         // Process emotes
         let mut formatted = html_output.clone();
 
         for (emote_name, emote_id) in emotes {
-            let emote_url = format!("https://cdn.discordapp.com/emojis/{}.png", emote_id);
+            let emote_url = format!("https://cdn.discordapp.com/emojis/{emote_id}.png");
 
             // Try to get from cache or upload
             let mxc_url = {
@@ -372,11 +372,10 @@ impl MatrixClient {
             };
 
             let emote_html = format!(
-                r#"<img alt=":{0}:" title=":{0}:" height="32" src="{1}" data-mx-emoticon />"#,
-                emote_name, mxc_url
+                r#"<img alt=":{emote_name}:" title=":{emote_name}:" height="32" src="{mxc_url}" data-mx-emoticon />"#
             );
 
-            formatted = formatted.replace(&format!(":{}:", emote_name), &emote_html);
+            formatted = formatted.replace(&format!(":{emote_name}:"), &emote_html);
         }
 
         // Return plain and formatted versions
@@ -629,7 +628,7 @@ impl MatrixClient {
     }
 
     /// Fetch custom emoji (image packs) for a room
-    /// Supports MSC2545 (im.ponies.emote_rooms) used by Nheko, Cinny, etc.
+    /// Supports MSC2545 (`im.ponies.emote_rooms`) used by Nheko, Cinny, etc.
     pub async fn fetch_room_emojis(&self, room_id: &str) -> Result<HashMap<String, String>> {
         let mut emojis = HashMap::new();
 
@@ -674,12 +673,12 @@ impl MatrixClient {
             )
             .await;
 
-        if let Ok(state_event) = resp {
-            if let Some(images) = state_event["images"].as_object() {
-                for (shortcode, image_data) in images {
-                    if let Some(url) = image_data["url"].as_str() {
-                        emojis.insert(shortcode.clone(), url.to_string());
-                    }
+        if let Ok(state_event) = resp
+            && let Some(images) = state_event["images"].as_object()
+        {
+            for (shortcode, image_data) in images {
+                if let Some(url) = image_data["url"].as_str() {
+                    emojis.insert(shortcode.clone(), url.to_string());
                 }
             }
         }
@@ -696,7 +695,7 @@ impl MatrixClient {
     }
 
     /// Parse Matrix message and extract custom emoji usage
-    /// Returns emoji_map where emoji_map is shortcode -> MXC URL
+    /// Returns `emoji_map` where `emoji_map` is shortcode -> MXC URL
     pub fn parse_matrix_emojis(
         &self,
         body: &str,
@@ -835,15 +834,15 @@ impl MatrixClient {
         // First check the cache
         {
             let members = self.cache.m_members.read();
-            if let Some(room_members) = members.get(room_id) {
-                if room_members.contains_key(mxid) {
-                    return Ok(true);
-                }
+            if let Some(room_members) = members.get(room_id)
+                && room_members.contains_key(mxid)
+            {
+                return Ok(true);
             }
         }
 
         // If not in cache, query the homeserver
-        let resp = match self
+        let Ok(resp) = self
             .send_request(
                 Method::GET,
                 &format!("/rooms/{}/joined_members", urlencoding::encode(room_id)),
@@ -851,12 +850,9 @@ impl MatrixClient {
                 None,
             )
             .await
-        {
-            Ok(r) => r,
-            Err(_) => {
-                // Room might not exist or we don't have access
-                return Ok(false);
-            }
+        else {
+            // Room might not exist or we don't have access
+            return Ok(false);
         };
 
         // Check if the user is in the joined members

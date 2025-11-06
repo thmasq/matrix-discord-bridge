@@ -15,6 +15,7 @@ use serenity::{
         guild::{Guild, Member},
     },
 };
+use std::fmt::Write;
 use std::{collections::HashMap, sync::Arc};
 
 #[allow(dead_code)]
@@ -36,7 +37,7 @@ impl DiscordHandler {
     }
 
     fn get_discriminator(user: &serenity::model::user::User) -> u16 {
-        user.discriminator.map(|d| d.get()).unwrap_or(0)
+        user.discriminator.map_or(0, std::num::NonZero::get)
     }
 
     fn process_discord_message(&self, message: &Message) -> (String, HashMap<String, String>) {
@@ -69,9 +70,9 @@ impl DiscordHandler {
                     };
 
                     if let Some(name) = role_name {
-                        content = content.replace(&cap[0], &format!("@{}", name));
+                        content = content.replace(&cap[0], &format!("@{name}"));
                     } else {
-                        content = content.replace(&cap[0], &format!("@role-{}", role_id));
+                        content = content.replace(&cap[0], &format!("@role-{role_id}"));
                     }
                 } else {
                     content = content.replace(&cap[0], "@deleted-role");
@@ -97,9 +98,9 @@ impl DiscordHandler {
                     };
 
                     if let Some(name) = channel_name {
-                        content = content.replace(&cap[0], &format!("#{}", name));
+                        content = content.replace(&cap[0], &format!("#{name}"));
                     } else {
-                        content = content.replace(&cap[0], &format!("#channel-{}", channel_id));
+                        content = content.replace(&cap[0], &format!("#channel-{channel_id}"));
                     }
                 } else {
                     content = content.replace(&cap[0], "#deleted-channel");
@@ -157,35 +158,35 @@ impl DiscordHandler {
             embed_text.push_str("\n\n---\n");
 
             if let Some(author) = &embed.author {
-                embed_text.push_str(&format!("**{}**\n", author.name));
+                let _ = writeln!(embed_text, "**{}**", author.name);
             }
 
             if let Some(title) = &embed.title {
                 if let Some(url) = &embed.url {
-                    embed_text.push_str(&format!("**[{}]({})**\n", title, url));
+                    let _ = writeln!(embed_text, "**[{title}]({url})**");
                 } else {
-                    embed_text.push_str(&format!("**{}**\n", title));
+                    let _ = writeln!(embed_text, "**{title}**");
                 }
             }
 
             if let Some(description) = &embed.description {
-                embed_text.push_str(&format!("{}\n", description));
+                let _ = writeln!(embed_text, "{description}");
             }
 
             for field in &embed.fields {
-                embed_text.push_str(&format!("\n**{}**\n{}", field.name, field.value));
+                let _ = writeln!(embed_text, "\n**{}**\n{}", field.name, field.value);
             }
 
             if let Some(footer) = &embed.footer {
-                embed_text.push_str(&format!("\n\n*{}*", footer.text));
+                let _ = write!(embed_text, "\n\n*{}*", footer.text);
             }
 
             if let Some(image) = &embed.image {
-                embed_text.push_str(&format!("\n{}", image.url));
+                let _ = write!(embed_text, "\n{}", image.url);
             }
 
             if let Some(thumbnail) = &embed.thumbnail {
-                embed_text.push_str(&format!("\n{}", thumbnail.url));
+                let _ = write!(embed_text, "\n{}", thumbnail.url);
             }
         }
 
@@ -216,7 +217,7 @@ impl DiscordHandler {
             username.to_string()
         } else {
             // Legacy username system
-            format!("{}#{:04}", username, discriminator)
+            format!("{username}#{discriminator:04}")
         };
 
         let mut updated = false;
@@ -224,7 +225,7 @@ impl DiscordHandler {
         // Update display name if changed
         if profile.username.as_deref() != Some(&display_name) {
             match self.matrix.set_display_name(&mxid, &display_name).await {
-                Ok(_) => {
+                Ok(()) => {
                     tracing::info!("Updated display name for {} to {}", mxid, display_name);
                     updated = true;
                 }
@@ -237,7 +238,7 @@ impl DiscordHandler {
         // Update avatar if changed
         if profile.avatar_url.as_deref() != Some(avatar_url) {
             match self.matrix.set_avatar(&mxid, avatar_url).await {
-                Ok(_) => {
+                Ok(()) => {
                     tracing::info!("Updated avatar for {}", mxid);
                     updated = true;
                 }
@@ -291,10 +292,10 @@ impl DiscordHandler {
 
             self.matrix.set_display_name(&mxid, &display_name).await?;
 
-            if let Some(avatar) = message.author.avatar_url() {
-                if let Err(e) = self.matrix.set_avatar(&mxid, &avatar).await {
-                    tracing::warn!("Failed to set avatar for {}: {}", mxid, e);
-                }
+            if let Some(avatar) = message.author.avatar_url()
+                && let Err(e) = self.matrix.set_avatar(&mxid, &avatar).await
+            {
+                tracing::warn!("Failed to set avatar for {}: {}", mxid, e);
             }
         } else if message.webhook_id.is_some() {
             // For webhook messages, always sync profile
@@ -318,7 +319,9 @@ impl DiscordHandler {
             .await
             .unwrap_or(false);
 
-        if !is_in_room {
+        if is_in_room {
+            tracing::debug!("User {} already in room {}", mxid, room_id);
+        } else {
             // User not in room, invite and join
             if let Err(e) = self.matrix.send_invite(room_id, &mxid).await {
                 tracing::debug!("Invite failed for {} (may already be invited): {}", mxid, e);
@@ -327,8 +330,6 @@ impl DiscordHandler {
             if let Err(e) = self.matrix.join_room(room_id, Some(&mxid)).await {
                 tracing::debug!("Join failed for {} (may already be in room): {}", mxid, e);
             }
-        } else {
-            tracing::debug!("User {} already in room {}", mxid, room_id);
         }
 
         Ok(mxid)
@@ -431,7 +432,7 @@ impl DiscordHandler {
                 );
             } else {
                 // No match - will need to upload from Discord
-                let discord_url = format!("https://cdn.discordapp.com/emojis/{}.png", discord_id);
+                let discord_url = format!("https://cdn.discordapp.com/emojis/{discord_id}.png");
 
                 // Check if we've already uploaded this emoji
                 let cached_mxc = {
@@ -471,7 +472,7 @@ impl DiscordHandler {
             .await;
 
         if let Some(event_id) = reply_to_event_id {
-            let reply_fallback_plain = format!("> In reply to {}\n\n{}", event_id, plain_body);
+            let reply_fallback_plain = format!("> In reply to {event_id}\n\n{plain_body}");
 
             let escape_html = |s: &str| -> String {
                 s.replace('&', "&amp;")
@@ -481,17 +482,16 @@ impl DiscordHandler {
                     .replace('\'', "&#39;")
             };
 
-            let reply_content_html = if formatted_body != plain_body {
-                formatted_body.clone()
-            } else {
+            let reply_content_html = if formatted_body == plain_body {
                 escape_html(&plain_body)
+            } else {
+                formatted_body.clone()
             };
 
             let reply_fallback_html = format!(
                 "<mx-reply><blockquote>\
-                <a href=\"https://matrix.to/#/{}\">In reply to</a>\
-                </blockquote></mx-reply>{}",
-                event_id, reply_content_html
+                <a href=\"https://matrix.to/#/{event_id}\">In reply to</a>\
+                </blockquote></mx-reply>{reply_content_html}"
             );
 
             let content =
@@ -518,12 +518,10 @@ impl DiscordHandler {
                     content
                 }
             }
+        } else if formatted_body == plain_body {
+            RoomMessageEventContent::text_plain(plain_body)
         } else {
-            if formatted_body != plain_body {
-                RoomMessageEventContent::text_html(plain_body, formatted_body)
-            } else {
-                RoomMessageEventContent::text_plain(plain_body)
-            }
+            RoomMessageEventContent::text_html(plain_body, formatted_body)
         }
     }
 }
@@ -670,15 +668,14 @@ impl EventHandler for DiscordHandler {
         }
 
         // Resolve Matrix room ID
-        let room_id = match self.resolve_room_id(&channel_id_str).await {
-            Some(rid) => rid,
-            None => {
-                tracing::warn!(
-                    "Could not resolve Matrix room for Discord channel {}",
-                    channel_id_str
-                );
-                return;
-            }
+        let room_id = if let Some(rid) = self.resolve_room_id(&channel_id_str).await {
+            rid
+        } else {
+            tracing::warn!(
+                "Could not resolve Matrix room for Discord channel {}",
+                channel_id_str
+            );
+            return;
         };
 
         // Ensure user exists and is in room
@@ -777,13 +774,39 @@ impl EventHandler for DiscordHandler {
         // Send stickers
         let stickers = self.process_stickers(&message);
         for sticker_url in stickers {
-            let sticker_content = RoomMessageEventContent::text_plain(&sticker_url);
-            if let Err(e) = self
+            let sticker_name = sticker_url.split('/').next_back().unwrap_or("sticker.png");
+
+            match self
                 .matrix
-                .send_message(&room_id, sticker_content, Some(&mxid))
+                .send_sticker(&room_id, &mxid, &sticker_url, sticker_name)
                 .await
             {
-                tracing::error!("Failed to send sticker: {}", e);
+                Ok(event_id) => {
+                    tracing::info!(
+                        "Forwarded Discord message {} to Matrix event {}",
+                        message.id,
+                        event_id
+                    );
+
+                    // Move event_id here — this is the one and only move
+                    message_event_id = Some(event_id);
+
+                    // Now borrow from message_event_id instead of owning again
+                    if let Some(ref eid) = message_event_id {
+                        self.cache
+                            .d_messages
+                            .write()
+                            .insert(message.id.to_string(), eid.clone());
+
+                        self.cache
+                            .m_messages
+                            .write()
+                            .insert(eid.clone(), message.id.to_string());
+                    }
+                }
+                Err(e) => {
+                    tracing::error!("Failed to send sticker to Matrix: {}", e);
+                }
             }
         }
     }
@@ -796,12 +819,11 @@ impl EventHandler for DiscordHandler {
         _event: MessageUpdateEvent,
     ) {
         // We need the new message content
-        let new_msg = match new {
-            Some(msg) => msg,
-            None => {
-                tracing::debug!("Message update without new content, ignoring");
-                return;
-            }
+        let new_msg = if let Some(msg) = new {
+            msg
+        } else {
+            tracing::debug!("Message update without new content, ignoring");
+            return;
         };
 
         // Ignore bot messages
@@ -835,24 +857,22 @@ impl EventHandler for DiscordHandler {
             d_messages.get(&new_msg.id.to_string()).cloned()
         };
 
-        let matrix_event_id = match matrix_event_id {
-            Some(id) => id,
-            None => {
-                tracing::debug!(
-                    "No Matrix event found for Discord message edit {}",
-                    new_msg.id
-                );
-                return;
-            }
+        let matrix_event_id = if let Some(id) = matrix_event_id {
+            id
+        } else {
+            tracing::debug!(
+                "No Matrix event found for Discord message edit {}",
+                new_msg.id
+            );
+            return;
         };
 
         // Resolve room ID
-        let room_id = match self.resolve_room_id(&channel_id_str).await {
-            Some(rid) => rid,
-            None => {
-                tracing::warn!("Could not resolve Matrix room for edit");
-                return;
-            }
+        let room_id = if let Some(rid) = self.resolve_room_id(&channel_id_str).await {
+            rid
+        } else {
+            tracing::warn!("Could not resolve Matrix room for edit");
+            return;
         };
 
         let mxid = self
@@ -870,10 +890,10 @@ impl EventHandler for DiscordHandler {
 
         let (plain_body, formatted_body) = self.matrix.process_for_matrix(&content, &emotes).await;
 
-        let new_content = if formatted_body != plain_body {
-            RoomMessageEventContent::text_html(plain_body, formatted_body)
-        } else {
+        let new_content = if formatted_body == plain_body {
             RoomMessageEventContent::text_plain(plain_body)
+        } else {
+            RoomMessageEventContent::text_html(plain_body, formatted_body)
         };
 
         match self
@@ -922,24 +942,22 @@ impl EventHandler for DiscordHandler {
             d_messages.get(&deleted_message_id.to_string()).cloned()
         };
 
-        let matrix_event_id = match matrix_event_id {
-            Some(id) => id,
-            None => {
-                tracing::debug!(
-                    "No Matrix event found for Discord message deletion {}",
-                    deleted_message_id
-                );
-                return;
-            }
+        let matrix_event_id = if let Some(id) = matrix_event_id {
+            id
+        } else {
+            tracing::debug!(
+                "No Matrix event found for Discord message deletion {}",
+                deleted_message_id
+            );
+            return;
         };
 
         // Resolve room ID
-        let room_id = match self.resolve_room_id(&channel_id_str).await {
-            Some(rid) => rid,
-            None => {
-                tracing::warn!("Could not resolve Matrix room for deletion");
-                return;
-            }
+        let room_id = if let Some(rid) = self.resolve_room_id(&channel_id_str).await {
+            rid
+        } else {
+            tracing::warn!("Could not resolve Matrix room for deletion");
+            return;
         };
 
         // Send redaction to Matrix
@@ -948,7 +966,7 @@ impl EventHandler for DiscordHandler {
             .redact_event(&room_id, &matrix_event_id, None)
             .await
         {
-            Ok(_) => {
+            Ok(()) => {
                 tracing::info!(
                     "Sent Matrix redaction for Discord message deletion {}",
                     deleted_message_id
@@ -988,38 +1006,35 @@ impl EventHandler for DiscordHandler {
             d_messages.get(&reaction.message_id.to_string()).cloned()
         };
 
-        let matrix_event_id = match matrix_event_id {
-            Some(id) => id,
-            None => {
-                tracing::debug!(
-                    "No Matrix event found for Discord reaction on message {}",
-                    reaction.message_id
-                );
-                return;
-            }
+        let matrix_event_id = if let Some(id) = matrix_event_id {
+            id
+        } else {
+            tracing::debug!(
+                "No Matrix event found for Discord reaction on message {}",
+                reaction.message_id
+            );
+            return;
         };
 
-        let room_id = match self.resolve_room_id(&channel_id_str).await {
-            Some(rid) => rid,
-            None => {
-                tracing::warn!("Could not resolve Matrix room for reaction");
-                return;
-            }
+        let room_id = if let Some(rid) = self.resolve_room_id(&channel_id_str).await {
+            rid
+        } else {
+            tracing::warn!("Could not resolve Matrix room for reaction");
+            return;
         };
 
         // Get the user who reacted
-        let user = match reaction.user_id {
-            Some(uid) => match ctx.http.get_user(uid).await {
+        let user = if let Some(uid) = reaction.user_id {
+            match ctx.http.get_user(uid).await {
                 Ok(u) => u,
                 Err(e) => {
                     tracing::error!("Failed to get user {}: {}", uid, e);
                     return;
                 }
-            },
-            None => {
-                tracing::warn!("Reaction without user_id");
-                return;
             }
+        } else {
+            tracing::warn!("Reaction without user_id");
+            return;
         };
 
         // Don't react for bots
@@ -1035,8 +1050,7 @@ impl EventHandler for DiscordHandler {
             ReactionType::Custom { name, id, .. } => {
                 // For custom emojis, use :name: format
                 name.as_ref()
-                    .map(|n| format!(":{}:", n))
-                    .unwrap_or_else(|| format!(":custom_{}:", id))
+                    .map_or_else(|| format!(":custom_{id}:"), |n| format!(":{n}:"))
             }
             _ => {
                 tracing::debug!("Unknown reaction type");
@@ -1083,26 +1097,24 @@ impl EventHandler for DiscordHandler {
             return;
         }
 
-        let room_id = match self.resolve_room_id(&channel_id_str).await {
-            Some(rid) => rid,
-            None => {
-                tracing::warn!("Could not resolve Matrix room for reaction removal");
-                return;
-            }
+        let room_id = if let Some(rid) = self.resolve_room_id(&channel_id_str).await {
+            rid
+        } else {
+            tracing::warn!("Could not resolve Matrix room for reaction removal");
+            return;
         };
 
-        let user = match reaction.user_id {
-            Some(uid) => match ctx.http.get_user(uid).await {
+        let user = if let Some(uid) = reaction.user_id {
+            match ctx.http.get_user(uid).await {
                 Ok(u) => u,
                 Err(e) => {
                     tracing::error!("Failed to get user {}: {}", uid, e);
                     return;
                 }
-            },
-            None => {
-                tracing::warn!("Reaction removal without user_id");
-                return;
             }
+        } else {
+            tracing::warn!("Reaction removal without user_id");
+            return;
         };
 
         if user.bot {
@@ -1113,8 +1125,7 @@ impl EventHandler for DiscordHandler {
             ReactionType::Unicode(emoji) => emoji.clone(),
             ReactionType::Custom { name, id, .. } => name
                 .as_ref()
-                .map(|n| format!(":{}:", n))
-                .unwrap_or_else(|| format!(":custom_{}:", id)),
+                .map_or_else(|| format!(":custom_{id}:"), |n| format!(":{n}:")),
             _ => return,
         };
 
@@ -1127,7 +1138,7 @@ impl EventHandler for DiscordHandler {
 
         if let Some(event_id) = reaction_event_id {
             match self.matrix.redact_event(&room_id, &event_id, None).await {
-                Ok(_) => {
+                Ok(()) => {
                     tracing::info!("Redacted Matrix reaction {}", event_id);
                     self.cache.d_messages.write().remove(&cache_key);
                 }

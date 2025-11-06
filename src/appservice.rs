@@ -177,12 +177,12 @@ impl AppService {
         self.cache.m_members.write().remove(room_id);
 
         // If it's an invite to our bot user in a DM, join
-        if state_key == self.config.full_user_id() {
-            if let Some(true) = content["is_direct"].as_bool() {
-                tracing::info!("Ignoring invite from user")
-                // tracing::info!("Joining DM room {}", room_id);
-                // self.matrix.join_room(room_id, None).await?;
-            }
+        if state_key == self.config.full_user_id()
+            && let Some(true) = content["is_direct"].as_bool()
+        {
+            tracing::info!("Ignoring invite from user");
+            // tracing::info!("Joining DM room {}", room_id);
+            // self.matrix.join_room(room_id, None).await?;
         }
 
         Ok(())
@@ -211,13 +211,13 @@ impl AppService {
 
         // Check if this is an edit
         let relates_to = content.get("m.relates_to");
-        if let Some(rel) = relates_to {
-            if rel["rel_type"].as_str() == Some("m.replace") {
-                let original_event_id = rel["event_id"].as_str().unwrap_or("");
-                return self
-                    .handle_message_edit(room_id, sender, event_id, original_event_id, content)
-                    .await;
-            }
+        if let Some(rel) = relates_to
+            && rel["rel_type"].as_str() == Some("m.replace")
+        {
+            let original_event_id = rel["event_id"].as_str().unwrap_or("");
+            return self
+                .handle_message_edit(room_id, sender, event_id, original_event_id, content)
+                .await;
         }
 
         // Check if room is bridged
@@ -267,10 +267,10 @@ impl AppService {
         let members = self.get_room_members(room_id).await?;
         let member = members.get(sender);
 
-        let display_name = member
-            .and_then(|m| m.display_name.as_ref())
-            .map(|s| s.as_str())
-            .unwrap_or_else(|| sender.split(':').next().unwrap_or(sender));
+        let display_name = member.and_then(|m| m.display_name.as_ref()).map_or_else(
+            || sender.split(':').next().unwrap_or(sender),
+            std::string::String::as_str,
+        );
 
         let avatar_url = member
             .and_then(|m| m.avatar_url.as_ref())
@@ -414,7 +414,7 @@ impl AppService {
                     }
                 }
 
-                let content = RoomMessageEventContent::text_plain(&format!(
+                let content = RoomMessageEventContent::text_plain(format!(
                     "✓ Room successfully bridged to Discord channel #{} ({})",
                     channel_info.name, channel_id
                 ));
@@ -428,9 +428,8 @@ impl AppService {
             }
             Err(e) => {
                 tracing::error!("Failed to verify Discord channel {}: {}", channel_id, e);
-                let content = RoomMessageEventContent::text_plain(&format!(
-                    "Failed to bridge: {}. Make sure the channel exists and the bot has access.",
-                    e
+                let content = RoomMessageEventContent::text_plain(format!(
+                    "Failed to bridge: {e}. Make sure the channel exists and the bot has access."
                 ));
                 let _ = self.matrix.send_message(room_id, content, None).await;
             }
@@ -440,7 +439,7 @@ impl AppService {
     }
 
     async fn verify_discord_channel(&self, channel_id: &str) -> crate::error::Result<ChannelInfo> {
-        let url = format!("https://discord.com/api/v10/channels/{}", channel_id);
+        let url = format!("https://discord.com/api/v10/channels/{channel_id}");
 
         let response = self
             .discord_http
@@ -452,27 +451,21 @@ impl AppService {
             .send()
             .await
             .map_err(|e| {
-                BridgeError::Discord(serenity::Error::from(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    e.to_string(),
-                )))
+                BridgeError::Discord(serenity::Error::from(std::io::Error::other(e.to_string())))
             })?;
 
         if !response.status().is_success() {
             let status = response.status();
             let error_text = response.text().await.unwrap_or_default();
             return Err(BridgeError::Discord(serenity::Error::from(
-                std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    format!("Discord API error {}: {}", status, error_text),
-                ),
+                std::io::Error::other(format!("Discord API error {status}: {error_text}")),
             )));
         }
 
         let channel_data: Value = response
             .json()
             .await
-            .map_err(|e| BridgeError::Matrix(format!("Failed to parse Discord response: {}", e)))?;
+            .map_err(|e| BridgeError::Matrix(format!("Failed to parse Discord response: {e}")))?;
 
         // Check if it's a text channel (type 0) or news channel (type 5)
         let channel_type = channel_data["type"].as_u64().unwrap_or(999);
@@ -558,7 +551,7 @@ impl AppService {
         // Handle Matrix custom emojis -> Discord emojis
         // Try to match by name first, otherwise fall back to uploading
         for (shortcode, mxc_url) in &matrix_emojis {
-            let emoji_pattern = format!(":{}:", shortcode);
+            let emoji_pattern = format!(":{shortcode}:");
 
             // Check if there's a Discord emoji with the same name
             if let Some(discord_format) = discord_emojis.get(shortcode) {
@@ -589,10 +582,10 @@ impl AppService {
             let emotes = self.cache.d_emotes.read();
             let emote_regex = regex::Regex::new(r":(\w+):").unwrap();
             for cap in emote_regex.captures_iter(body) {
-                if let Some(name) = cap.get(1) {
-                    if let Some(discord_emote) = emotes.get(name.as_str()) {
-                        processed_body = processed_body.replace(&cap[0], discord_emote);
-                    }
+                if let Some(name) = cap.get(1)
+                    && let Some(discord_emote) = emotes.get(name.as_str())
+                {
+                    processed_body = processed_body.replace(&cap[0], discord_emote);
                 }
             }
         }
@@ -600,17 +593,17 @@ impl AppService {
         // Truncate to Discord's message limit
         if processed_body.len() > DISCORD_MESSAGE_LIMIT {
             processed_body.truncate(DISCORD_MESSAGE_LIMIT);
-            processed_body.push_str("…");
+            processed_body.push('…');
         }
 
         // Get member info for avatar and display name
         let members = self.get_room_members(room_id).await?;
         let member = members.get(sender);
 
-        let display_name = member
-            .and_then(|m| m.display_name.as_ref())
-            .map(|s| s.as_str())
-            .unwrap_or_else(|| sender.split(':').next().unwrap_or(sender));
+        let display_name = member.and_then(|m| m.display_name.as_ref()).map_or_else(
+            || sender.split(':').next().unwrap_or(sender),
+            std::string::String::as_str,
+        );
 
         let avatar_url = member
             .and_then(|m| m.avatar_url.as_ref())
@@ -671,10 +664,10 @@ impl AppService {
         let members = self.get_room_members(room_id).await?;
         let member = members.get(sender);
 
-        let display_name = member
-            .and_then(|m| m.display_name.as_ref())
-            .map(|s| s.as_str())
-            .unwrap_or_else(|| sender.split(':').next().unwrap_or(sender));
+        let display_name = member.and_then(|m| m.display_name.as_ref()).map_or_else(
+            || sender.split(':').next().unwrap_or(sender),
+            std::string::String::as_str,
+        );
 
         let avatar_url = member
             .and_then(|m| m.avatar_url.as_ref())
@@ -729,12 +722,11 @@ impl AppService {
             messages.get(original_event_id).cloned()
         };
 
-        let discord_msg_id = match discord_msg_id {
-            Some(id) => id,
-            None => {
-                tracing::debug!("No Discord message found for edit of {}", original_event_id);
-                return Ok(());
-            }
+        let discord_msg_id = if let Some(id) = discord_msg_id {
+            id
+        } else {
+            tracing::debug!("No Discord message found for edit of {}", original_event_id);
+            return Ok(());
         };
 
         // Get the new content
@@ -762,18 +754,17 @@ impl AppService {
             let emotes = self.cache.d_emotes.read();
             let emote_regex = regex::Regex::new(r":(\w+):").unwrap();
             for cap in emote_regex.captures_iter(body) {
-                if let Some(name) = cap.get(1) {
-                    if let Some(discord_emote) = emotes.get(name.as_str()) {
-                        processed_body = processed_body.replace(&cap[0], discord_emote);
-                    }
+                if let Some(name) = cap.get(1)
+                    && let Some(discord_emote) = emotes.get(name.as_str())
+                {
+                    processed_body = processed_body.replace(&cap[0], discord_emote);
                 }
             }
         }
 
-        const DISCORD_MESSAGE_LIMIT: usize = 2000;
         if processed_body.len() > DISCORD_MESSAGE_LIMIT {
             processed_body.truncate(DISCORD_MESSAGE_LIMIT);
-            processed_body.push_str("…");
+            processed_body.push('…');
         }
 
         // Get channel ID
@@ -854,21 +845,19 @@ impl AppService {
             messages.get(redacts).cloned()
         };
 
-        let discord_msg_id = match discord_msg_id {
-            Some(id) => id,
-            None => {
-                tracing::debug!("No Discord message found for redaction of {}", redacts);
-                return Ok(());
-            }
+        let discord_msg_id = if let Some(id) = discord_msg_id {
+            id
+        } else {
+            tracing::debug!("No Discord message found for redaction of {}", redacts);
+            return Ok(());
         };
 
         // Get the channel ID
-        let channel_id = match self.db.get_channel(room_id).await? {
-            Some(id) => id,
-            None => {
-                tracing::warn!("Room {} not bridged, cannot redact message", room_id);
-                return Ok(());
-            }
+        let channel_id = if let Some(id) = self.db.get_channel(room_id).await? {
+            id
+        } else {
+            tracing::warn!("Room {} not bridged, cannot redact message", room_id);
+            return Ok(());
         };
 
         // Get webhook
@@ -882,7 +871,7 @@ impl AppService {
 
         // Delete the Discord message
         match self.delete_webhook_message(&webhook, &discord_msg_id).await {
-            Ok(_) => {
+            Ok(()) => {
                 tracing::info!(
                     "Deleted Discord message {} due to Matrix redaction",
                     discord_msg_id
@@ -930,12 +919,11 @@ impl AppService {
             messages.get(target_event_id).cloned()
         };
 
-        let discord_msg_id = match discord_msg_id {
-            Some(id) => id,
-            None => {
-                tracing::debug!("No Discord message found for reaction");
-                return Ok(());
-            }
+        let discord_msg_id = if let Some(id) = discord_msg_id {
+            id
+        } else {
+            tracing::debug!("No Discord message found for reaction");
+            return Ok(());
         };
 
         // Get channel ID
@@ -978,8 +966,7 @@ impl AppService {
 
         // Add reaction via Discord API
         let url = format!(
-            "https://discord.com/api/v10/channels/{}/messages/{}/reactions/{}/@me",
-            channel_id, discord_msg_id, discord_emoji
+            "https://discord.com/api/v10/channels/{channel_id}/messages/{discord_msg_id}/reactions/{discord_emoji}/@me"
         );
 
         let response = self
@@ -992,10 +979,7 @@ impl AppService {
             .send()
             .await
             .map_err(|e| {
-                BridgeError::Discord(serenity::Error::from(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    e.to_string(),
-                )))
+                BridgeError::Discord(serenity::Error::from(std::io::Error::other(e.to_string())))
             })?;
 
         if !response.status().is_success() {
@@ -1003,15 +987,12 @@ impl AppService {
             let error_text = response.text().await.unwrap_or_default();
             tracing::error!("Failed to add Discord reaction {}: {}", status, error_text);
             return Err(BridgeError::Discord(serenity::Error::from(
-                std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    format!("Discord reaction failed: {}", status),
-                ),
+                std::io::Error::other(format!("Discord reaction failed: {status}")),
             )));
         }
 
         // Cache the reaction mapping for removal
-        let cache_key = format!("{}:{}:{}", discord_msg_id, sender, reaction_key);
+        let cache_key = format!("{discord_msg_id}:{sender}:{reaction_key}");
         self.cache
             .m_messages
             .write()
@@ -1053,7 +1034,7 @@ impl AppService {
                 // 2. But this would show as the bot, not the user
                 // This is a limitation of Discord's API with webhooks.
 
-                let url = format!("https://discord.com/api/v10/channels/{}/typing", channel_id);
+                let url = format!("https://discord.com/api/v10/channels/{channel_id}/typing");
 
                 if let Err(e) = self
                     .discord_http
@@ -1086,10 +1067,7 @@ impl AppService {
         }
 
         // Fetch existing webhooks
-        let url = format!(
-            "https://discord.com/api/v10/channels/{}/webhooks",
-            channel_id
-        );
+        let url = format!("https://discord.com/api/v10/channels/{channel_id}/webhooks");
 
         let response = self
             .discord_http
@@ -1101,24 +1079,19 @@ impl AppService {
             .send()
             .await
             .map_err(|e| {
-                BridgeError::Discord(serenity::Error::from(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    e.to_string(),
-                )))
+                BridgeError::Discord(serenity::Error::from(std::io::Error::other(e.to_string())))
             })?;
 
         if !response.status().is_success() {
             return Err(BridgeError::Discord(serenity::Error::from(
-                std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    format!("Failed to fetch webhooks: {}", response.status()),
-                ),
+                std::io::Error::other(format!("Failed to fetch webhooks: {}", response.status())),
             )));
         }
 
-        let webhooks: Vec<Value> = response.json().await.map_err(|e| {
-            BridgeError::Matrix(format!("Failed to parse webhooks response: {}", e))
-        })?;
+        let webhooks: Vec<Value> = response
+            .json()
+            .await
+            .map_err(|e| BridgeError::Matrix(format!("Failed to parse webhooks response: {e}")))?;
 
         // Look for existing bridge webhook
         let existing = webhooks
@@ -1132,10 +1105,7 @@ impl AppService {
             }
         } else {
             // Create new webhook
-            let create_url = format!(
-                "https://discord.com/api/v10/channels/{}/webhooks",
-                channel_id
-            );
+            let create_url = format!("https://discord.com/api/v10/channels/{channel_id}/webhooks");
             let create_body = json!({
                 "name": "matrix_bridge"
             });
@@ -1151,20 +1121,17 @@ impl AppService {
                 .json(&create_body)
                 .send()
                 .await
-                .map_err(|e| BridgeError::Matrix(format!("Failed to create webhook: {}", e)))?;
+                .map_err(|e| BridgeError::Matrix(format!("Failed to create webhook: {e}")))?;
 
             if !response.status().is_success() {
                 let error_text = response.text().await.unwrap_or_default();
                 return Err(BridgeError::Discord(serenity::Error::from(
-                    std::io::Error::new(
-                        std::io::ErrorKind::Other,
-                        format!("Failed to create webhook: {}", error_text),
-                    ),
+                    std::io::Error::other(format!("Failed to create webhook: {error_text}")),
                 )));
             }
 
             let webhook: Value = response.json().await.map_err(|e| {
-                BridgeError::Matrix(format!("Failed to parse webhook response: {}", e))
+                BridgeError::Matrix(format!("Failed to parse webhook response: {e}"))
             })?;
 
             WebhookData {
@@ -1202,7 +1169,8 @@ impl AppService {
         );
 
         if let Some(tid) = thread_id {
-            url.push_str(&format!("&thread_id={}", tid));
+            url.push_str("&thread_id=");
+            url.push_str(tid);
         }
 
         let mut body = json!({
@@ -1224,23 +1192,20 @@ impl AppService {
             .json(&body)
             .send()
             .await
-            .map_err(|e| BridgeError::Matrix(format!("Failed to send webhook message: {}", e)))?;
+            .map_err(|e| BridgeError::Matrix(format!("Failed to send webhook message: {e}")))?;
 
         if !response.status().is_success() {
             let status = response.status();
             let error_text = response.text().await.unwrap_or_default();
             return Err(BridgeError::Discord(serenity::Error::from(
-                std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    format!("Webhook send failed {}: {}", status, error_text),
-                ),
+                std::io::Error::other(format!("Webhook send failed {status}: {error_text}")),
             )));
         }
 
         let message: Value = response
             .json()
             .await
-            .map_err(|e| BridgeError::Matrix(format!("Failed to parse webhook response: {}", e)))?;
+            .map_err(|e| BridgeError::Matrix(format!("Failed to parse webhook response: {e}")))?;
 
         Ok(message["id"].as_str().unwrap().to_string())
     }
@@ -1277,23 +1242,20 @@ impl AppService {
         let response = request
             .send()
             .await
-            .map_err(|e| BridgeError::Matrix(format!("Failed to send webhook with file: {}", e)))?;
+            .map_err(|e| BridgeError::Matrix(format!("Failed to send webhook with file: {e}")))?;
 
         if !response.status().is_success() {
             let status = response.status();
             let error_text = response.text().await.unwrap_or_default();
             return Err(BridgeError::Discord(serenity::Error::from(
-                std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    format!("Webhook file send failed {}: {}", status, error_text),
-                ),
+                std::io::Error::other(format!("Webhook file send failed {status}: {error_text}")),
             )));
         }
 
         let message: Value = response
             .json()
             .await
-            .map_err(|e| BridgeError::Matrix(format!("Failed to parse webhook response: {}", e)))?;
+            .map_err(|e| BridgeError::Matrix(format!("Failed to parse webhook response: {e}")))?;
 
         Ok(message["id"].as_str().unwrap().to_string())
     }
@@ -1320,7 +1282,7 @@ impl AppService {
             .json(&body)
             .send()
             .await
-            .map_err(|e| BridgeError::Matrix(format!("Failed to edit webhook message: {}", e)))?;
+            .map_err(|e| BridgeError::Matrix(format!("Failed to edit webhook message: {e}")))?;
 
         if !response.status().is_success() {
             let status = response.status();
@@ -1333,8 +1295,7 @@ impl AppService {
             }
 
             return Err(BridgeError::Matrix(format!(
-                "Webhook edit failed {}: {}",
-                status, error_text
+                "Webhook edit failed {status}: {error_text}"
             )));
         }
 
@@ -1352,10 +1313,7 @@ impl AppService {
         );
 
         let response = self.discord_http.delete(&url).send().await.map_err(|e| {
-            BridgeError::Discord(serenity::Error::from(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                e.to_string(),
-            )))
+            BridgeError::Discord(serenity::Error::from(std::io::Error::other(e.to_string())))
         })?;
 
         if !response.status().is_success() {
@@ -1369,10 +1327,7 @@ impl AppService {
 
             let error_text = response.text().await.unwrap_or_default();
             return Err(BridgeError::Discord(serenity::Error::from(
-                std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    format!("Webhook delete failed {}: {}", status, error_text),
-                ),
+                std::io::Error::other(format!("Webhook delete failed {status}: {error_text}")),
             )));
         }
 
