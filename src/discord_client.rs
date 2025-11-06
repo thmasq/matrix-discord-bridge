@@ -56,10 +56,23 @@ impl DiscordHandler {
         for cap in role_regex.captures_iter(&message.content.clone()) {
             if let Some(role_id_match) = cap.get(1) {
                 let role_id = role_id_match.as_str();
-                // Try to get role name from guild
-                if let Some(_guild_id) = message.guild_id {
-                    // In production, cache role names
-                    content = content.replace(&cap[0], &format!("@role-{}", role_id));
+
+                // Try to get role name from cache
+                if let Some(guild_id) = message.guild_id {
+                    let guild_id_str = guild_id.to_string();
+                    let role_name = {
+                        let roles = self.cache.d_roles.read();
+                        roles
+                            .get(&guild_id_str)
+                            .and_then(|guild_roles| guild_roles.get(role_id))
+                            .cloned()
+                    };
+
+                    if let Some(name) = role_name {
+                        content = content.replace(&cap[0], &format!("@{}", name));
+                    } else {
+                        content = content.replace(&cap[0], &format!("@role-{}", role_id));
+                    }
                 } else {
                     content = content.replace(&cap[0], "@deleted-role");
                 }
@@ -71,11 +84,23 @@ impl DiscordHandler {
         for cap in channel_regex.captures_iter(&message.content.clone()) {
             if let Some(channel_id_match) = cap.get(1) {
                 let channel_id = channel_id_match.as_str();
-                // Try to resolve channel name
-                if let Some(_guild_id) = message.guild_id {
-                    // In a production system, we'd cache channel names
-                    // For now, use a generic format
-                    content = content.replace(&cap[0], &format!("#channel-{}", channel_id));
+
+                // Try to get channel name from cache
+                if let Some(guild_id) = message.guild_id {
+                    let guild_id_str = guild_id.to_string();
+                    let channel_name = {
+                        let channels = self.cache.d_channels.read();
+                        channels
+                            .get(&guild_id_str)
+                            .and_then(|guild_channels| guild_channels.get(channel_id))
+                            .cloned()
+                    };
+
+                    if let Some(name) = channel_name {
+                        content = content.replace(&cap[0], &format!("#{}", name));
+                    } else {
+                        content = content.replace(&cap[0], &format!("#channel-{}", channel_id));
+                    }
                 } else {
                     content = content.replace(&cap[0], "#deleted-channel");
                 }
@@ -286,14 +311,24 @@ impl DiscordHandler {
                 .await;
         }
 
-        // Ensure user is in the room by inviting and joining
-        // Check if already in room (simplified - in production, query room members)
-        if let Err(e) = self.matrix.send_invite(room_id, &mxid).await {
-            tracing::debug!("Invite failed for {} (may already be in room): {}", mxid, e);
-        }
+        // Check if user is already in the room
+        let is_in_room = self
+            .matrix
+            .is_user_in_room(room_id, &mxid)
+            .await
+            .unwrap_or(false);
 
-        if let Err(e) = self.matrix.join_room(room_id, Some(&mxid)).await {
-            tracing::debug!("Join failed for {} (may already be in room): {}", mxid, e);
+        if !is_in_room {
+            // User not in room, invite and join
+            if let Err(e) = self.matrix.send_invite(room_id, &mxid).await {
+                tracing::debug!("Invite failed for {} (may already be invited): {}", mxid, e);
+            }
+
+            if let Err(e) = self.matrix.join_room(room_id, Some(&mxid)).await {
+                tracing::debug!("Join failed for {} (may already be in room): {}", mxid, e);
+            }
+        } else {
+            tracing::debug!("User {} already in room {}", mxid, room_id);
         }
 
         Ok(mxid)
@@ -502,6 +537,8 @@ impl EventHandler for DiscordHandler {
     async fn guild_create(&self, _ctx: Context, guild: Guild, _is_new: Option<bool>) {
         tracing::info!("Guild available: {} ({})", guild.name, guild.id);
 
+        let guild_id_str = guild.id.to_string();
+
         // Cache emotes
         {
             let mut emotes = self.cache.d_emotes.write();
@@ -518,6 +555,32 @@ impl EventHandler for DiscordHandler {
                 guild.emojis.len(),
                 guild.id
             );
+        }
+
+        // Cache roles
+        {
+            let mut roles_cache = self.cache.d_roles.write();
+            let mut guild_roles = HashMap::new();
+            for (role_id, role) in &guild.roles {
+                guild_roles.insert(role_id.to_string(), role.name.clone());
+            }
+            tracing::debug!("Cached {} roles from guild {}", guild_roles.len(), guild.id);
+            roles_cache.insert(guild_id_str.clone(), guild_roles);
+        }
+
+        // Cache channels
+        {
+            let mut channels_cache = self.cache.d_channels.write();
+            let mut guild_channels = HashMap::new();
+            for (channel_id, channel) in &guild.channels {
+                guild_channels.insert(channel_id.to_string(), channel.name.clone());
+            }
+            tracing::debug!(
+                "Cached {} channels from guild {}",
+                guild_channels.len(),
+                guild.id
+            );
+            channels_cache.insert(guild_id_str, guild_channels);
         }
 
         // Sync profiles for all members (async in background)

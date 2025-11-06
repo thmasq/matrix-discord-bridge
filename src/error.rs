@@ -20,9 +20,6 @@ pub enum BridgeError {
     #[error("Matrix error: {0}")]
     Matrix(String),
 
-    #[error("Invalid token")]
-    InvalidToken,
-
     #[error("Not found")]
     NotFound,
 

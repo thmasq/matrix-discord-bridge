@@ -153,6 +153,7 @@ impl AppService {
         match event_type {
             "m.room.member" => self.handle_member_event(event).await,
             "m.room.message" => self.handle_message_event(event).await,
+            "m.sticker" => self.handle_sticker_event(event).await,
             "m.room.redaction" => self.handle_redaction_event(event).await,
             "m.reaction" => self.handle_reaction_event(event).await,
             "m.typing" => self.handle_typing_event(event).await,
@@ -232,6 +233,95 @@ impl AppService {
                 )
                 .await;
         }
+
+        Ok(())
+    }
+
+    async fn handle_sticker_event(&self, event: &Value) -> crate::error::Result<()> {
+        let room_id = event["room_id"].as_str().unwrap();
+        let sender = event["sender"].as_str().unwrap();
+        let event_id = event["event_id"].as_str().unwrap();
+        let content = &event["content"];
+
+        // Ignore our own stickers (bot and puppet users)
+        if sender.starts_with("@_discord_") || sender == self.config.full_user_id() {
+            return Ok(());
+        }
+
+        // Check if room is bridged
+        let channel_id = match self.db.get_channel(room_id).await? {
+            Some(id) => id,
+            None => return Ok(()), // Not bridged
+        };
+
+        let url = content["url"]
+            .as_str()
+            .ok_or_else(|| BridgeError::Matrix("Sticker missing url field".to_string()))?;
+
+        let body = content["body"].as_str().unwrap_or("sticker");
+
+        // Download from Matrix
+        let sticker_data = self.matrix.download_media(url).await?;
+
+        // Get member info for display name and avatar
+        let members = self.get_room_members(room_id).await?;
+        let member = members.get(sender);
+
+        let display_name = member
+            .and_then(|m| m.display_name.as_ref())
+            .map(|s| s.as_str())
+            .unwrap_or_else(|| sender.split(':').next().unwrap_or(sender));
+
+        let avatar_url = member
+            .and_then(|m| m.avatar_url.as_ref())
+            .and_then(|mxc| self.matrix.mxc_to_http(mxc));
+
+        tracing::info!(
+            "Forwarding sticker from {} to Discord channel {}",
+            sender,
+            channel_id
+        );
+
+        // Get webhook
+        let webhook = self.get_or_create_webhook(&channel_id).await?;
+
+        // Determine filename from content or use default
+        let info = content.get("info");
+        let filename = if let Some(mimetype) = info.and_then(|i| i["mimetype"].as_str()) {
+            if mimetype.contains("gif") {
+                "sticker.gif"
+            } else if mimetype.contains("webp") {
+                "sticker.webp"
+            } else {
+                "sticker.png"
+            }
+        } else {
+            "sticker.png"
+        };
+
+        // Send sticker as an image file to Discord
+        let discord_msg_id = self
+            .send_webhook_with_file(
+                &webhook,
+                body,
+                display_name,
+                avatar_url.as_deref(),
+                filename,
+                &sticker_data,
+            )
+            .await?;
+
+        // Cache the mapping
+        self.cache
+            .m_messages
+            .write()
+            .insert(event_id.to_string(), discord_msg_id.clone());
+        self.cache
+            .d_messages
+            .write()
+            .insert(discord_msg_id, event_id.to_string());
+
+        tracing::info!("Successfully sent Matrix sticker {} to Discord", event_id);
 
         Ok(())
     }

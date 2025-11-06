@@ -20,6 +20,10 @@ pub struct Cache {
     pub d_webhooks: Arc<RwLock<HashMap<String, WebhookInfo>>>,
     // Matrix room_id -> emoji shortcode -> MXC URL
     pub m_custom_emojis: Arc<RwLock<HashMap<String, HashMap<String, String>>>>,
+    // Discord guild_id -> role_id -> role name
+    pub d_roles: Arc<RwLock<HashMap<String, HashMap<String, String>>>>,
+    // Discord guild_id -> channel_id -> channel name
+    pub d_channels: Arc<RwLock<HashMap<String, HashMap<String, String>>>>,
 }
 
 #[derive(Debug, Clone)]
@@ -45,6 +49,8 @@ impl Default for Cache {
             m_emotes: Arc::new(RwLock::new(HashMap::new())),
             d_webhooks: Arc::new(RwLock::new(HashMap::new())),
             m_custom_emojis: Arc::new(RwLock::new(HashMap::new())),
+            d_roles: Arc::new(RwLock::new(HashMap::new())),
+            d_channels: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 }

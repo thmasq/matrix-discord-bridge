@@ -756,4 +756,114 @@ impl MatrixClient {
         // Fetch and cache
         self.fetch_room_emojis(room_id).await
     }
+
+    pub async fn send_sticker(
+        &self,
+        room_id: &str,
+        mxid: &str,
+        sticker_url: &str,
+        filename: &str,
+    ) -> Result<String> {
+        // Download the sticker
+        let uri: Uri = sticker_url.parse().unwrap();
+        let req = HyperRequest::builder()
+            .uri(uri)
+            .body(Full::new(Bytes::new()))
+            .unwrap();
+
+        let res = self.http_client.request(req).await?;
+        let bytes = res.collect().await?.to_bytes();
+
+        // Determine content type from URL or default to PNG
+        let content_type = if sticker_url.ends_with(".gif") {
+            "image/gif"
+        } else if sticker_url.ends_with(".webp") {
+            "image/webp"
+        } else {
+            "image/png"
+        };
+
+        // Upload to homeserver
+        let upload_url = format!("{}/_matrix/media/r0/upload", self.config.homeserver);
+        let upload_req = HyperRequest::builder()
+            .method(Method::POST)
+            .uri(upload_url)
+            .header("Authorization", format!("Bearer {}", self.config.as_token))
+            .header("Content-Type", content_type)
+            .body(Full::new(bytes.clone()))
+            .unwrap();
+
+        let res = self.http_client.request(upload_req).await?;
+        let body = res.collect().await?.to_bytes();
+        let upload_resp: Value = serde_json::from_slice(&body)?;
+        let mxc_url = upload_resp["content_uri"].as_str().unwrap();
+
+        // Try to extract dimensions if possible (Discord stickers are typically 320x320)
+        let info = json!({
+            "mimetype": content_type,
+            "size": bytes.len(),
+            "w": 320,
+            "h": 320
+        });
+
+        // Create sticker content
+        let content = json!({
+            "body": filename,
+            "url": mxc_url,
+            "info": info
+        });
+
+        // Send as m.sticker event
+        let txn_id = uuid::Uuid::new_v4();
+        let resp = self
+            .send_request(
+                Method::PUT,
+                &format!(
+                    "/rooms/{}/send/m.sticker/{}",
+                    urlencoding::encode(room_id),
+                    txn_id
+                ),
+                Some(content),
+                Some(mxid),
+            )
+            .await?;
+
+        Ok(resp["event_id"].as_str().unwrap().to_string())
+    }
+
+    pub async fn is_user_in_room(&self, room_id: &str, mxid: &str) -> Result<bool> {
+        // First check the cache
+        {
+            let members = self.cache.m_members.read();
+            if let Some(room_members) = members.get(room_id) {
+                if room_members.contains_key(mxid) {
+                    return Ok(true);
+                }
+            }
+        }
+
+        // If not in cache, query the homeserver
+        let resp = match self
+            .send_request(
+                Method::GET,
+                &format!("/rooms/{}/joined_members", urlencoding::encode(room_id)),
+                None,
+                None,
+            )
+            .await
+        {
+            Ok(r) => r,
+            Err(_) => {
+                // Room might not exist or we don't have access
+                return Ok(false);
+            }
+        };
+
+        // Check if the user is in the joined members
+        if let Some(joined) = resp["joined"].as_object() {
+            Ok(joined.contains_key(mxid))
+        } else {
+            Ok(false)
+        }
+    }
 }
