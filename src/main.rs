@@ -1,3 +1,4 @@
+mod admin_commands;
 mod appservice;
 mod cache;
 mod config;
@@ -26,7 +27,8 @@ async fn main() -> anyhow::Result<()> {
 
     // Get base directory from args or use current directory
     let base_dir = env::args()
-        .nth(1).map_or_else(|| env::current_dir().unwrap(), PathBuf::from);
+        .nth(1)
+        .map_or_else(|| env::current_dir().unwrap(), PathBuf::from);
 
     if !base_dir.exists() {
         anyhow::bail!("Path '{}' does not exist!", base_dir.display());

@@ -1,6 +1,6 @@
 use crate::{
-    cache::Cache, config::Config, db::Database, error::BridgeError, matrix_client::MatrixClient,
-    utils::DISCORD_MESSAGE_LIMIT,
+    admin_commands::AdminCommandHandler, cache::Cache, config::Config, db::Database,
+    error::BridgeError, matrix_client::MatrixClient, utils::DISCORD_MESSAGE_LIMIT,
 };
 use http_body_util::{BodyExt, Full};
 use hyper::{
@@ -10,7 +10,6 @@ use hyper::{
     service::service_fn,
 };
 use hyper_util::rt::TokioIo;
-use ruma::events::room::message::RoomMessageEventContent;
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -22,6 +21,7 @@ pub struct AppService {
     db: Database,
     cache: Cache,
     discord_http: reqwest::Client,
+    admin_handler: AdminCommandHandler,
 }
 
 impl AppService {
@@ -31,12 +31,21 @@ impl AppService {
             .build()
             .expect("Failed to create HTTP client");
 
+        let admin_handler = AdminCommandHandler::new(
+            config.clone(),
+            matrix.clone(),
+            db.clone(),
+            cache.clone(),
+            discord_http.clone(),
+        );
+
         Self {
             config,
             matrix,
             db,
             cache,
             discord_http,
+            admin_handler,
         }
     }
 
@@ -201,11 +210,14 @@ impl AppService {
 
         let msgtype = content["msgtype"].as_str().unwrap_or("m.text");
 
-        // Handle bridge commands
+        // Handle admin commands in config room
         if msgtype == "m.text" {
             let body = content["body"].as_str().unwrap_or("");
-            if body.starts_with("!bridge ") {
-                return self.handle_bridge_command(room_id, sender, body).await;
+            if body.starts_with('!') {
+                return self
+                    .admin_handler
+                    .handle_command(room_id, sender, body)
+                    .await;
             }
         }
 
@@ -347,144 +359,6 @@ impl AppService {
         Ok(())
     }
 
-    async fn handle_bridge_command(
-        &self,
-        room_id: &str,
-        _sender: &str,
-        body: &str,
-    ) -> crate::error::Result<()> {
-        let parts: Vec<&str> = body.split_whitespace().collect();
-        if parts.len() < 2 {
-            let content = RoomMessageEventContent::text_plain("Usage: !bridge <channel_id>");
-            let _ = self.matrix.send_message(room_id, content, None).await;
-            return Ok(());
-        }
-
-        let channel_id = parts[1];
-
-        // Validate channel ID format (Discord snowflakes are numeric)
-        if !channel_id.chars().all(|c| c.is_ascii_digit()) {
-            let content = RoomMessageEventContent::text_plain(
-                "Invalid channel ID format. Channel IDs should be numeric.",
-            );
-            let _ = self.matrix.send_message(room_id, content, None).await;
-            return Ok(());
-        }
-
-        tracing::info!(
-            "Bridge command: linking room {} to Discord channel {}",
-            room_id,
-            channel_id
-        );
-
-        // Verify we have access to this channel
-        match self.verify_discord_channel(channel_id).await {
-            Ok(channel_info) => {
-                // Check if channel is already bridged
-                let existing_channels = self.db.list_channels().await?;
-                if existing_channels.contains(&channel_id.to_string()) {
-                    let content = RoomMessageEventContent::text_plain(
-                        "This Discord channel is already bridged to another room.",
-                    );
-                    let _ = self.matrix.send_message(room_id, content, None).await;
-                    return Ok(());
-                }
-
-                // Create the bridge link
-                self.db.add_room(room_id, channel_id).await?;
-
-                // Update cache
-                let room_alias = self.matrix.matrixify_room(channel_id);
-                self.cache
-                    .m_rooms
-                    .write()
-                    .insert(room_alias, room_id.to_string());
-
-                // Prefetch custom emojis for the room
-                match self.matrix.fetch_room_emojis(room_id).await {
-                    Ok(emojis) => {
-                        tracing::info!(
-                            "Prefetched {} custom emojis for room {}",
-                            emojis.len(),
-                            room_id
-                        );
-                    }
-                    Err(e) => {
-                        tracing::warn!("Failed to prefetch emojis: {}", e);
-                    }
-                }
-
-                let content = RoomMessageEventContent::text_plain(format!(
-                    "✓ Room successfully bridged to Discord channel #{} ({})",
-                    channel_info.name, channel_id
-                ));
-                let _ = self.matrix.send_message(room_id, content, None).await;
-
-                tracing::info!(
-                    "Successfully bridged room {} to channel {}",
-                    room_id,
-                    channel_id
-                );
-            }
-            Err(e) => {
-                tracing::error!("Failed to verify Discord channel {}: {}", channel_id, e);
-                let content = RoomMessageEventContent::text_plain(format!(
-                    "Failed to bridge: {e}. Make sure the channel exists and the bot has access."
-                ));
-                let _ = self.matrix.send_message(room_id, content, None).await;
-            }
-        }
-
-        Ok(())
-    }
-
-    async fn verify_discord_channel(&self, channel_id: &str) -> crate::error::Result<ChannelInfo> {
-        let url = format!("https://discord.com/api/v10/channels/{channel_id}");
-
-        let response = self
-            .discord_http
-            .get(&url)
-            .header(
-                "Authorization",
-                format!("Bot {}", self.config.discord_token),
-            )
-            .send()
-            .await
-            .map_err(|e| {
-                BridgeError::Discord(serenity::Error::from(std::io::Error::other(e.to_string())))
-            })?;
-
-        if !response.status().is_success() {
-            let status = response.status();
-            let error_text = response.text().await.unwrap_or_default();
-            return Err(BridgeError::Discord(serenity::Error::from(
-                std::io::Error::other(format!("Discord API error {status}: {error_text}")),
-            )));
-        }
-
-        let channel_data: Value = response
-            .json()
-            .await
-            .map_err(|e| BridgeError::Matrix(format!("Failed to parse Discord response: {e}")))?;
-
-        // Check if it's a text channel (type 0) or news channel (type 5)
-        let channel_type = channel_data["type"].as_u64().unwrap_or(999);
-        if channel_type != 0 && channel_type != 5 {
-            return Err(BridgeError::Config(
-                "Channel must be a text channel or news channel".to_string(),
-            ));
-        }
-
-        Ok(ChannelInfo {
-            id: channel_id.to_string(),
-            name: channel_data["name"]
-                .as_str()
-                .unwrap_or("unknown")
-                .to_string(),
-            guild_id: channel_data["guild_id"].as_str().map(String::from),
-        })
-    }
-
     async fn forward_message_to_discord(
         &self,
         room_id: &str,
@@ -494,7 +368,6 @@ impl AppService {
         channel_id: &str,
         msgtype: &str,
     ) -> crate::error::Result<()> {
-        // Handle different message types
         match msgtype {
             "m.text" | "m.notice" | "m.emote" => {
                 self.forward_text_to_discord(room_id, sender, event_id, content, channel_id)
@@ -1339,12 +1212,4 @@ impl AppService {
 struct WebhookData {
     id: String,
     token: String,
-}
-
-#[derive(Debug, Clone)]
-#[allow(dead_code)]
-struct ChannelInfo {
-    id: String,
-    name: String,
-    guild_id: Option<String>,
 }

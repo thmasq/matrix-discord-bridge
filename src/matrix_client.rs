@@ -111,6 +111,7 @@ impl MatrixClient {
         Ok(())
     }
 
+    #[allow(dead_code)]
     pub async fn create_room(
         &self,
         channel_id: &str,

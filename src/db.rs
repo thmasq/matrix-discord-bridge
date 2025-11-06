@@ -14,6 +14,7 @@ pub struct BridgedRoom {
 
 #[derive(Debug, sqlx::FromRow)]
 pub struct BridgedUser {
+    #[allow(dead_code)]
     pub mxid: String,
     pub avatar_url: Option<String>,
     pub username: Option<String>,
@@ -73,6 +74,21 @@ impl Database {
             .fetch_all(&self.pool)
             .await?;
         Ok(channels)
+    }
+
+    pub async fn list_all_bridges(&self) -> crate::error::Result<Vec<BridgedRoom>> {
+        let bridges = sqlx::query_as::<_, BridgedRoom>("SELECT room_id, channel_id FROM bridge")
+            .fetch_all(&self.pool)
+            .await?;
+        Ok(bridges)
+    }
+
+    pub async fn remove_room(&self, room_id: &str) -> crate::error::Result<()> {
+        sqlx::query("DELETE FROM bridge WHERE room_id = ?")
+            .bind(room_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
     }
 
     pub async fn add_user(&self, mxid: &str) -> crate::error::Result<()> {

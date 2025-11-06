@@ -11,6 +11,7 @@ pub struct Config {
     pub discord_token: String,
     pub port: u16,
     pub database: PathBuf,
+    pub config_room_id: Option<String>,
 }
 
 impl Config {
@@ -29,6 +30,7 @@ impl Config {
             discord_token: "my-secret-discord-token".to_string(),
             port: 5000,
             database: PathBuf::from("bridge.db"),
+            config_room_id: None,
         };
 
         let content = serde_json::to_string_pretty(&default)?;
