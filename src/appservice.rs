@@ -50,7 +50,7 @@ impl AppService {
     }
 
     pub async fn run(self: Arc<Self>) -> anyhow::Result<()> {
-        let addr = format!("127.0.0.1:{}", self.config.port);
+        let addr = format!("0.0.0.0:{}", self.config.port);
         let listener = TcpListener::bind(&addr).await?;
         tracing::info!("Appservice listening on {}", addr);
 
