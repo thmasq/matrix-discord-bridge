@@ -105,7 +105,7 @@ impl AppService {
         let path = req.uri().path();
         let method = req.method();
 
-        if method == Method::PUT && path.starts_with("/transactions/") {
+        if method == Method::PUT && path.starts_with("/_matrix/app/v1/transactions/") {
             self.handle_transaction(req).await
         } else {
             Ok(Response::builder()
