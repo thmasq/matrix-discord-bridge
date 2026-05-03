@@ -58,10 +58,16 @@ impl AdminCommandHandler {
             "unlink" => self.cmd_unlink(&parts[1..]).await,
             "status" => self.cmd_status(&parts[1..]).await,
             "verify" => self.cmd_verify(&parts[1..]).await,
+            "invite" => self.cmd_invite(&parts[1..]).await,
             _ => return Ok(()), // Unknown command, ignore
         };
 
-        let content = RoomMessageEventContent::text_plain(response);
+        let (plain_body, html_body) = self
+            .matrix
+            .process_for_matrix(&response, &std::collections::HashMap::new())
+            .await;
+
+        let content = RoomMessageEventContent::text_html(plain_body, html_body);
         let _ = self.matrix.send_message(room_id, content, None).await;
 
         Ok(())
@@ -84,7 +90,11 @@ impl AdminCommandHandler {
   Example: `!status !abc123:matrix.org`
 
 **!verify <discord_channel_id>** - Verify access to a Discord channel
-  Example: `!verify 123456789012345678`"#
+  Example: `!verify 123456789012345678`
+
+**!invite list** - List pending bot invites
+**!invite accept <id>** - Accept a pending invite
+**!invite delete <ids>** - Reject/delete invites (e.g., 2-4 or 5,6)"#
             .to_string()
     }
 
@@ -360,6 +370,92 @@ impl AdminCommandHandler {
             guild_id: channel_data["guild_id"].as_str().map(String::from),
             channel_type: channel_type as u8,
         })
+    }
+
+    async fn cmd_invite(&self, args: &[&str]) -> String {
+        if args.is_empty() {
+            return "Usage: `!invite <list|accept|delete> [args]`".to_string();
+        }
+
+        match args[0] {
+            "list" => match self.db.list_invites().await {
+                Ok(invites) => {
+                    if invites.is_empty() {
+                        "No pending invites.".to_string()
+                    } else {
+                        let mut response = "**Pending Invites:**\n\n".to_string();
+                        for inv in invites {
+                            response.push_str(&format!(
+                                "`{}` - `{}` (from `{}`)\n",
+                                inv.id, inv.room_id, inv.sender
+                            ));
+                        }
+                        response
+                    }
+                }
+                Err(e) => format!("Database error: {}", e),
+            },
+            "accept" => {
+                if args.len() < 2 {
+                    return "Usage: `!invite accept <id>`".to_string();
+                }
+                if let Ok(id) = args[1].parse::<i64>() {
+                    match self.db.get_invite(id).await {
+                        Ok(Some(invite)) => {
+                            match self.matrix.join_room(&invite.room_id, None).await {
+                                Ok(_) => {
+                                    let _ = self.db.remove_invite(id).await;
+                                    format!("Accepted invite to `{}`", invite.room_id)
+                                }
+                                Err(e) => format!("❌ Failed to join room: {}", e),
+                            }
+                        }
+                        Ok(None) => format!("Invite ID `{}` not found.", id),
+                        Err(e) => format!("Database error: {}", e),
+                    }
+                } else {
+                    "Invalid invite ID format.".to_string()
+                }
+            }
+            "delete" => {
+                if args.len() < 2 {
+                    return "Usage: `!invite delete <id_or_ranges>` (e.g. 1-3 or 4,5)".to_string();
+                }
+
+                // Parse the input (e.g. ["2-4,", "5"] becomes "2-4,5")
+                let mut ids = std::collections::HashSet::new();
+                let input = args[1..].join("");
+
+                for part in input.split(',') {
+                    if let Some((start, end)) = part.split_once('-') {
+                        if let (Ok(s), Ok(e)) =
+                            (start.trim().parse::<i64>(), end.trim().parse::<i64>())
+                        {
+                            for id in s..=e {
+                                ids.insert(id);
+                            }
+                        }
+                    } else if let Ok(id) = part.trim().parse::<i64>() {
+                        ids.insert(id);
+                    }
+                }
+
+                if ids.is_empty() {
+                    return "No valid IDs provided.".to_string();
+                }
+
+                let mut success_count = 0;
+                for id in ids {
+                    if let Ok(Some(invite)) = self.db.get_invite(id).await {
+                        let _ = self.matrix.leave_room(&invite.room_id, None).await;
+                        let _ = self.db.remove_invite(id).await;
+                        success_count += 1;
+                    }
+                }
+                format!("Deleted {} invite(s).", success_count)
+            }
+            _ => "Unknown invite action. Use `list`, `accept`, or `delete`.".to_string(),
+        }
     }
 }
 

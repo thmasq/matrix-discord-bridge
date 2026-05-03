@@ -897,4 +897,15 @@ impl MatrixClient {
             formatted_body: content["formatted_body"].as_str().map(String::from),
         })
     }
+
+    pub async fn leave_room(&self, room_id: &str, mxid: Option<&str>) -> Result<()> {
+        self.send_request(
+            Method::POST,
+            &format!("/rooms/{}/leave", urlencoding::encode(room_id)),
+            Some(json!({})),
+            mxid,
+        )
+        .await?;
+        Ok(())
+    }
 }
