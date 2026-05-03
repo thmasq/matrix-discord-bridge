@@ -121,12 +121,20 @@ impl AppService {
     ) -> crate::error::Result<Response<Full<Bytes>>> {
         // Verify hs_token
         let query = req.uri().query().unwrap_or("");
-        let token = query
+        let token_query = query
             .split('&')
             .find(|s| s.starts_with("access_token="))
             .and_then(|s| s.strip_prefix("access_token="));
 
-        if token != Some(&self.config.hs_token) {
+        let token_header = req
+            .headers()
+            .get("Authorization")
+            .and_then(|h| h.to_str().ok())
+            .and_then(|s| s.strip_prefix("Bearer "));
+
+        if token_query != Some(&self.config.hs_token)
+            && token_header != Some(self.config.hs_token.as_str())
+        {
             return Ok(Response::builder()
                 .status(StatusCode::FORBIDDEN)
                 .body(Full::new(Bytes::from(
