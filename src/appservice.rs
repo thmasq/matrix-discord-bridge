@@ -186,22 +186,40 @@ impl AppService {
 
     async fn handle_member_event(&self, event: &Value) -> crate::error::Result<()> {
         let room_id = event["room_id"].as_str().unwrap();
-        let _sender = event["sender"].as_str().unwrap();
+        let sender = event["sender"].as_str().unwrap();
         let state_key = event["state_key"].as_str().unwrap();
         let content = &event["content"];
+        let membership = content["membership"].as_str().unwrap_or("");
 
         // Clear member cache for this room
         self.cache.m_members.write().remove(room_id);
 
-        // If it's an invite to our bot user in a DM, join
-        if state_key == self.config.full_user_id()
-            && let Some(true) = content["is_direct"].as_bool()
-        {
-            tracing::info!("Ignoring invite from user");
-            // tracing::info!("Joining DM room {}", room_id);
-            // self.matrix.join_room(room_id, None).await?;
-        }
+        // If it's an event targeting our bot user
+        if state_key == self.config.full_user_id() {
+            if membership == "invite" {
+                self.db.add_invite(room_id, sender).await?;
 
+                // Notify admin config room
+                if let Some(config_room) = &self.config.config_room_id {
+                    // Prevent ping loops if the bot is invited to its own config room
+                    if config_room != room_id {
+                        let msg = format!(
+                            "Received new invite to `{}` from `{}`. Use `!invite list` to manage.",
+                            room_id, sender
+                        );
+                        let msg_content =
+                            ruma::events::room::message::RoomMessageEventContent::text_plain(msg);
+                        let _ = self
+                            .matrix
+                            .send_message(config_room, msg_content, None)
+                            .await;
+                    }
+                }
+            } else if membership == "leave" || membership == "ban" {
+                // If the bot leaves, is kicked, or an invite is retracted, clean up the DB
+                let _ = self.db.remove_invite_by_room(room_id).await;
+            }
+        }
         Ok(())
     }
 

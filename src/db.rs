@@ -20,6 +20,13 @@ pub struct BridgedUser {
     pub username: Option<String>,
 }
 
+#[derive(Debug, sqlx::FromRow)]
+pub struct PendingInvite {
+    pub id: i64,
+    pub room_id: String,
+    pub sender: String,
+}
+
 impl Database {
     pub async fn new(path: impl AsRef<Path>) -> crate::error::Result<Self> {
         let url = format!("sqlite:{}", path.as_ref().display());
@@ -43,6 +50,16 @@ impl Database {
                 mxid TEXT PRIMARY KEY,
                 avatar_url TEXT,
                 username TEXT
+            )",
+        )
+        .execute(&pool)
+        .await?;
+
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS invites (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                room_id TEXT NOT NULL UNIQUE,
+                sender TEXT NOT NULL
             )",
         )
         .execute(&pool)
@@ -120,6 +137,48 @@ impl Database {
         sqlx::query("UPDATE users SET username = ? WHERE mxid = ?")
             .bind(username)
             .bind(mxid)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn add_invite(&self, room_id: &str, sender: &str) -> crate::error::Result<()> {
+        sqlx::query("INSERT OR REPLACE INTO invites (room_id, sender) VALUES (?, ?)")
+            .bind(room_id)
+            .bind(sender)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn list_invites(&self) -> crate::error::Result<Vec<PendingInvite>> {
+        let invites = sqlx::query_as::<_, PendingInvite>("SELECT id, room_id, sender FROM invites")
+            .fetch_all(&self.pool)
+            .await?;
+        Ok(invites)
+    }
+
+    pub async fn get_invite(&self, id: i64) -> crate::error::Result<Option<PendingInvite>> {
+        let invite = sqlx::query_as::<_, PendingInvite>(
+            "SELECT id, room_id, sender FROM invites WHERE id = ?",
+        )
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(invite)
+    }
+
+    pub async fn remove_invite(&self, id: i64) -> crate::error::Result<()> {
+        sqlx::query("DELETE FROM invites WHERE id = ?")
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn remove_invite_by_room(&self, room_id: &str) -> crate::error::Result<()> {
+        sqlx::query("DELETE FROM invites WHERE room_id = ?")
+            .bind(room_id)
             .execute(&self.pool)
             .await?;
         Ok(())
