@@ -12,7 +12,7 @@ pub enum BridgeError {
     Database(#[from] sqlx::Error),
 
     #[error("Discord error: {0}")]
-    Discord(#[from] serenity::Error),
+    Discord(#[from] Box<serenity::Error>),
 
     #[error("JSON error: {0}")]
     Json(#[from] serde_json::Error),

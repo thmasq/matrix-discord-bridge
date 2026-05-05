@@ -1,5 +1,9 @@
 use crate::{
-    cache::Cache, config::Config, db::Database, discord_client::AttachmentInfo, error::Result,
+    cache::Cache,
+    config::Config,
+    db::Database,
+    discord_client::AttachmentInfo,
+    error::{BridgeError, Result},
 };
 use http_body_util::{BodyExt, Full};
 use hyper::{Method, Request as HyperRequest, Uri, body::Bytes};
@@ -7,6 +11,7 @@ use hyper_util::client::legacy::{Client, connect::HttpConnector};
 use ruma::{OwnedRoomId, events::room::message::RoomMessageEventContent};
 use serde_json::{Value, json};
 use std::collections::HashMap;
+use std::fmt::Write;
 
 pub struct MatrixClient {
     config: Config,
@@ -17,7 +22,6 @@ pub struct MatrixClient {
 
 #[derive(Debug, Clone)]
 pub struct MatrixEvent {
-    #[allow(dead_code)]
     pub event_id: String,
     pub sender: String,
     pub body: String,
@@ -46,7 +50,7 @@ impl MatrixClient {
         let mut url = format!("{}/_matrix/client/r0{}", self.config.homeserver, path);
 
         if let Some(uid) = user_id {
-            url.push_str(&format!("?user_id={}", urlencoding::encode(uid)));
+            let _ = write!(url, "?user_id={}", urlencoding::encode(uid));
         }
 
         let uri: Uri = url.parse().unwrap();
@@ -120,7 +124,6 @@ impl MatrixClient {
         Ok(())
     }
 
-    #[allow(dead_code)]
     pub async fn create_room(
         &self,
         channel_id: &str,
@@ -209,8 +212,10 @@ impl MatrixClient {
     }
 
     pub async fn upload_from_url(&self, url: &str) -> Result<String> {
-        // Download from URL
-        let uri: Uri = url.parse().unwrap();
+        let uri: hyper::Uri = url
+            .parse()
+            .map_err(|e| BridgeError::Matrix(format!("Invalid avatar URL '{url}': {e}")))?;
+
         let req = HyperRequest::builder()
             .uri(uri)
             .body(Full::new(Bytes::new()))
@@ -288,7 +293,7 @@ impl MatrixClient {
 
         let room_id = resp["room_id"]
             .as_str()
-            .ok_or_else(|| crate::error::BridgeError::Matrix("No room_id in response".into()))?
+            .ok_or_else(|| BridgeError::Matrix("No room_id in response".into()))?
             .to_string();
 
         // Cache it
@@ -526,7 +531,7 @@ impl MatrixClient {
         let mxc_url = upload_resp["content_uri"].as_str().unwrap();
 
         // Determine message type based on content type
-        let (msgtype, extra_info) = self.determine_media_type(attachment, mxc_url, bytes.len());
+        let (msgtype, extra_info) = Self::determine_media_type(attachment, mxc_url, bytes.len());
 
         let content = json!({
             "msgtype": msgtype,
@@ -553,7 +558,6 @@ impl MatrixClient {
     }
 
     fn determine_media_type(
-        &self,
         attachment: &AttachmentInfo,
         mxc_url: &str,
         size: usize,
@@ -600,16 +604,12 @@ impl MatrixClient {
 
     pub async fn download_media(&self, mxc_url: &str) -> Result<Vec<u8>> {
         if !mxc_url.starts_with("mxc://") {
-            return Err(crate::error::BridgeError::Matrix(
-                "Invalid MXC URL".to_string(),
-            ));
+            return Err(BridgeError::Matrix("Invalid MXC URL".to_string()));
         }
 
         let parts: Vec<&str> = mxc_url.trim_start_matches("mxc://").split('/').collect();
         if parts.len() != 2 {
-            return Err(crate::error::BridgeError::Matrix(
-                "Invalid MXC URL format".to_string(),
-            ));
+            return Err(BridgeError::Matrix("Invalid MXC URL format".to_string()));
         }
 
         let download_url = format!(
@@ -627,7 +627,7 @@ impl MatrixClient {
         let res = self.http_client.request(req).await?;
 
         if res.status() != hyper::StatusCode::OK {
-            return Err(crate::error::BridgeError::Matrix(format!(
+            return Err(BridgeError::Matrix(format!(
                 "Failed to download media: {}",
                 res.status()
             )));
@@ -707,7 +707,6 @@ impl MatrixClient {
     /// Parse Matrix message and extract custom emoji usage
     /// Returns `emoji_map` where `emoji_map` is shortcode -> MXC URL
     pub fn parse_matrix_emojis(
-        &self,
         body: &str,
         formatted_body: Option<&str>,
     ) -> HashMap<String, String> {
@@ -784,9 +783,15 @@ impl MatrixClient {
         let bytes = res.collect().await?.to_bytes();
 
         // Determine content type from URL or default to PNG
-        let content_type = if sticker_url.ends_with(".gif") {
+        let content_type = if std::path::Path::new(sticker_url)
+            .extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("gif"))
+        {
             "image/gif"
-        } else if sticker_url.ends_with(".webp") {
+        } else if std::path::Path::new(sticker_url)
+            .extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("webp"))
+        {
             "image/webp"
         } else {
             "image/png"
@@ -866,11 +871,9 @@ impl MatrixClient {
         };
 
         // Check if the user is in the joined members
-        if let Some(joined) = resp["joined"].as_object() {
-            Ok(joined.contains_key(mxid))
-        } else {
-            Ok(false)
-        }
+        resp["joined"]
+            .as_object()
+            .map_or_else(|| Ok(false), |joined| Ok(joined.contains_key(mxid)))
     }
 
     pub async fn get_event(&self, room_id: &str, event_id: &str) -> Result<MatrixEvent> {

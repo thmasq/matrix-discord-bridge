@@ -199,17 +199,16 @@ impl AppService {
             if membership == "invite" {
                 // Extract room name from invite_room_state if available
                 let mut room_name = None;
-                if let Some(unsigned) = event.get("unsigned") {
-                    if let Some(invite_room_state) =
+                if let Some(unsigned) = event.get("unsigned")
+                    && let Some(invite_room_state) =
                         unsigned.get("invite_room_state").and_then(|s| s.as_array())
-                    {
-                        for state in invite_room_state {
-                            if state.get("type").and_then(|t| t.as_str()) == Some("m.room.name") {
-                                room_name = state
-                                    .get("content")
-                                    .and_then(|c| c.get("name"))
-                                    .and_then(|n| n.as_str());
-                            }
+                {
+                    for state in invite_room_state {
+                        if state.get("type").and_then(|t| t.as_str()) == Some("m.room.name") {
+                            room_name = state
+                                .get("content")
+                                .and_then(|c| c.get("name"))
+                                .and_then(|n| n.as_str());
                         }
                     }
                 }
@@ -221,8 +220,7 @@ impl AppService {
                     // Prevent ping loops if the bot is invited to its own config room
                     if config_room != room_id {
                         let msg = format!(
-                            "Received new invite to `{}` from `{}`. Use `!invite list` to manage.",
-                            room_id, sender
+                            "Received new invite to `{room_id}` from `{sender}`. Use `!invite list` to manage."
                         );
                         let msg_content =
                             ruma::events::room::message::RoomMessageEventContent::text_plain(msg);
@@ -304,9 +302,8 @@ impl AppService {
         }
 
         // Check if room is bridged
-        let channel_id = match self.db.get_channel(room_id).await? {
-            Some(id) => id,
-            None => return Ok(()), // Not bridged
+        let Some(channel_id) = self.db.get_channel(room_id).await? else {
+            return Ok(());
         };
 
         let url = content["url"]
@@ -342,17 +339,17 @@ impl AppService {
 
         // Determine filename from content or use default
         let info = content.get("info");
-        let filename = if let Some(mimetype) = info.and_then(|i| i["mimetype"].as_str()) {
-            if mimetype.contains("gif") {
-                "sticker.gif"
-            } else if mimetype.contains("webp") {
-                "sticker.webp"
-            } else {
-                "sticker.png"
-            }
-        } else {
-            "sticker.png"
-        };
+        let filename =
+            info.and_then(|i| i["mimetype"].as_str())
+                .map_or("sticker.png", |mimetype| {
+                    if mimetype.contains("gif") {
+                        "sticker.gif"
+                    } else if mimetype.contains("webp") {
+                        "sticker.webp"
+                    } else {
+                        "sticker.png"
+                    }
+                });
 
         // Send sticker as an image file to Discord
         let discord_msg_id = self
@@ -441,7 +438,7 @@ impl AppService {
         let formatted_body = content["formatted_body"].as_str();
 
         // Parse custom emojis from the message
-        let matrix_emojis = self.matrix.parse_matrix_emojis(body, formatted_body);
+        let matrix_emojis = MatrixClient::parse_matrix_emojis(body, formatted_body);
 
         // Get room's custom emojis and Discord emojis for matching
         let room_emojis = self
@@ -638,9 +635,7 @@ impl AppService {
             messages.get(original_event_id).cloned()
         };
 
-        let discord_msg_id = if let Some(id) = discord_msg_id {
-            id
-        } else {
+        let Some(discord_msg_id) = discord_msg_id else {
             tracing::debug!("No Discord message found for edit of {}", original_event_id);
             return Ok(());
         };
@@ -761,17 +756,13 @@ impl AppService {
             messages.get(redacts).cloned()
         };
 
-        let discord_msg_id = if let Some(id) = discord_msg_id {
-            id
-        } else {
+        let Some(discord_msg_id) = discord_msg_id else {
             tracing::debug!("No Discord message found for redaction of {}", redacts);
             return Ok(());
         };
 
         // Get the channel ID
-        let channel_id = if let Some(id) = self.db.get_channel(room_id).await? {
-            id
-        } else {
+        let Some(channel_id) = self.db.get_channel(room_id).await? else {
             tracing::warn!("Room {} not bridged, cannot redact message", room_id);
             return Ok(());
         };
@@ -835,9 +826,7 @@ impl AppService {
             messages.get(target_event_id).cloned()
         };
 
-        let discord_msg_id = if let Some(id) = discord_msg_id {
-            id
-        } else {
+        let Some(discord_msg_id) = discord_msg_id else {
             tracing::debug!("No Discord message found for reaction");
             return Ok(());
         };
@@ -856,19 +845,17 @@ impl AppService {
             let emotes = self.cache.d_emotes.read();
 
             // Extract just the emoji ID from the Discord format
-            if let Some(discord_format) = emotes.get(name) {
-                // Discord format is <:name:id> or <a:name:id>
-                let id_regex = regex::Regex::new(r":(\d+)>$").unwrap();
-                if let Some(cap) = id_regex.captures(discord_format) {
-                    format!("{}:{}", name, cap.get(1).unwrap().as_str())
-                } else {
-                    // Fallback to Unicode
-                    urlencoding::encode(reaction_key).to_string()
-                }
-            } else {
-                // Not found, might be a Unicode emoji represented as :name:
-                urlencoding::encode(reaction_key).to_string()
-            }
+            emotes.get(name).map_or_else(
+                || urlencoding::encode(reaction_key).to_string(),
+                |discord_format| {
+                    // Discord format is <:name:id> or <a:name:id>
+                    let id_regex = regex::Regex::new(r":(\d+)>$").unwrap();
+                    id_regex.captures(discord_format).map_or_else(
+                        || urlencoding::encode(reaction_key).to_string(),
+                        |cap| format!("{}:{}", name, cap.get(1).unwrap().as_str()),
+                    )
+                },
+            )
         } else {
             // Unicode emoji
             urlencoding::encode(reaction_key).to_string()
@@ -895,16 +882,18 @@ impl AppService {
             .send()
             .await
             .map_err(|e| {
-                BridgeError::Discord(serenity::Error::from(std::io::Error::other(e.to_string())))
+                BridgeError::Discord(Box::new(serenity::Error::from(std::io::Error::other(
+                    e.to_string(),
+                ))))
             })?;
 
         if !response.status().is_success() {
             let status = response.status();
             let error_text = response.text().await.unwrap_or_default();
             tracing::error!("Failed to add Discord reaction {}: {}", status, error_text);
-            return Err(BridgeError::Discord(serenity::Error::from(
+            return Err(BridgeError::Discord(Box::new(serenity::Error::from(
                 std::io::Error::other(format!("Discord reaction failed: {status}")),
-            )));
+            ))));
         }
 
         // Cache the reaction mapping for removal
@@ -926,9 +915,8 @@ impl AppService {
             .ok_or_else(|| BridgeError::Matrix("Typing event missing user_ids".to_string()))?;
 
         // Check if room is bridged
-        let channel_id = match self.db.get_channel(room_id).await? {
-            Some(id) => id,
-            None => return Ok(()), // Not bridged, ignore
+        let Some(channel_id) = self.db.get_channel(room_id).await? else {
+            return Ok(());
         };
 
         // Process typing indicators
@@ -995,13 +983,15 @@ impl AppService {
             .send()
             .await
             .map_err(|e| {
-                BridgeError::Discord(serenity::Error::from(std::io::Error::other(e.to_string())))
+                BridgeError::Discord(Box::new(serenity::Error::from(std::io::Error::other(
+                    e.to_string(),
+                ))))
             })?;
 
         if !response.status().is_success() {
-            return Err(BridgeError::Discord(serenity::Error::from(
+            return Err(BridgeError::Discord(Box::new(serenity::Error::from(
                 std::io::Error::other(format!("Failed to fetch webhooks: {}", response.status())),
-            )));
+            ))));
         }
 
         let webhooks: Vec<Value> = response
@@ -1041,9 +1031,9 @@ impl AppService {
 
             if !response.status().is_success() {
                 let error_text = response.text().await.unwrap_or_default();
-                return Err(BridgeError::Discord(serenity::Error::from(
+                return Err(BridgeError::Discord(Box::new(serenity::Error::from(
                     std::io::Error::other(format!("Failed to create webhook: {error_text}")),
-                )));
+                ))));
             }
 
             let webhook: Value = response.json().await.map_err(|e| {
@@ -1113,9 +1103,9 @@ impl AppService {
         if !response.status().is_success() {
             let status = response.status();
             let error_text = response.text().await.unwrap_or_default();
-            return Err(BridgeError::Discord(serenity::Error::from(
+            return Err(BridgeError::Discord(Box::new(serenity::Error::from(
                 std::io::Error::other(format!("Webhook send failed {status}: {error_text}")),
-            )));
+            ))));
         }
 
         let message: Value = response
@@ -1163,9 +1153,9 @@ impl AppService {
         if !response.status().is_success() {
             let status = response.status();
             let error_text = response.text().await.unwrap_or_default();
-            return Err(BridgeError::Discord(serenity::Error::from(
+            return Err(BridgeError::Discord(Box::new(serenity::Error::from(
                 std::io::Error::other(format!("Webhook file send failed {status}: {error_text}")),
-            )));
+            ))));
         }
 
         let message: Value = response
@@ -1229,7 +1219,9 @@ impl AppService {
         );
 
         let response = self.discord_http.delete(&url).send().await.map_err(|e| {
-            BridgeError::Discord(serenity::Error::from(std::io::Error::other(e.to_string())))
+            BridgeError::Discord(Box::new(serenity::Error::from(std::io::Error::other(
+                e.to_string(),
+            ))))
         })?;
 
         if !response.status().is_success() {
@@ -1242,9 +1234,9 @@ impl AppService {
             }
 
             let error_text = response.text().await.unwrap_or_default();
-            return Err(BridgeError::Discord(serenity::Error::from(
+            return Err(BridgeError::Discord(Box::new(serenity::Error::from(
                 std::io::Error::other(format!("Webhook delete failed {status}: {error_text}")),
-            )));
+            ))));
         }
 
         Ok(())

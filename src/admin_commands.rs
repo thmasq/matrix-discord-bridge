@@ -1,6 +1,7 @@
 use crate::{cache::Cache, config::Config, db::Database, matrix_client::MatrixClient};
 use ruma::events::room::message::RoomMessageEventContent;
 use serde_json::Value;
+use std::fmt::Write;
 use std::sync::Arc;
 
 pub struct AdminCommandHandler {
@@ -12,7 +13,7 @@ pub struct AdminCommandHandler {
 }
 
 impl AdminCommandHandler {
-    pub fn new(
+    pub const fn new(
         config: Config,
         matrix: Arc<MatrixClient>,
         db: Database,
@@ -52,7 +53,7 @@ impl AdminCommandHandler {
         let command = parts[0].trim_start_matches('!');
 
         let response = match command {
-            "help" => self.cmd_help(),
+            "help" => Self::cmd_help(),
             "list" => self.cmd_list().await,
             "link" => self.cmd_link(sender, &parts[1..]).await,
             "unlink" => self.cmd_unlink(&parts[1..]).await,
@@ -73,8 +74,8 @@ impl AdminCommandHandler {
         Ok(())
     }
 
-    fn cmd_help(&self) -> String {
-        r#"### -- Bridge Admin Commands --
+    fn cmd_help() -> String {
+        r"### -- Bridge Admin Commands --
 > \-  **!help** - Show this help message
 > 
 > \-  **!list** - List all current bridges
@@ -93,7 +94,7 @@ impl AdminCommandHandler {
 > 
 > \-  **!invite list** - List pending bot invites
 > \-  **!invite accept** <id> - Accept a pending invite
-> \-  **!invite delete** <ids> - Reject/delete invites (e.g., 2-4 or 5,6)"#
+> \-  **!invite delete** <ids> - Reject/delete invites (e.g., 2-4 or 5,6)"
             .to_string()
     }
 
@@ -105,15 +106,16 @@ impl AdminCommandHandler {
                 } else {
                     let mut response = format!("**Active Bridges ({}):**\n\n", bridges.len());
                     for bridge in bridges {
-                        response.push_str(&format!(
+                        let _ = write!(
+                            response,
                             "• Matrix: `{}`\n  Discord: `{}`\n\n",
                             bridge.room_id, bridge.channel_id
-                        ));
+                        );
                     }
                     response
                 }
             }
-            Err(e) => format!("Error listing bridges: {}", e),
+            Err(e) => format!("Error listing bridges: {e}"),
         }
     }
 
@@ -138,11 +140,11 @@ impl AdminCommandHandler {
         // Check if room is already bridged
         match self.db.get_channel(room_id).await {
             Ok(Some(_)) => {
-                return format!("Matrix room `{}` is already bridged.", room_id);
+                return format!("Matrix room `{room_id}` is already bridged.");
             }
             Ok(None) => {}
             Err(e) => {
-                return format!("Database error: {}", e);
+                return format!("Database error: {e}");
             }
         }
 
@@ -151,13 +153,12 @@ impl AdminCommandHandler {
             Ok(channels) => {
                 if channels.contains(&channel_id.to_string()) {
                     return format!(
-                        "Discord channel `{}` is already bridged to another room.",
-                        channel_id
+                        "Discord channel `{channel_id}` is already bridged to another room."
                     );
                 }
             }
             Err(e) => {
-                return format!("Database error: {}", e);
+                return format!("Database error: {e}");
             }
         }
 
@@ -193,14 +194,11 @@ impl AdminCommandHandler {
                             room_id, channel_info.name, channel_id
                         )
                     }
-                    Err(e) => format!("Failed to create bridge: {}", e),
+                    Err(e) => format!("Failed to create bridge: {e}"),
                 }
             }
             Err(e) => {
-                format!(
-                    "❌ Failed to verify Discord channel `{}`:\n{}",
-                    channel_id, e
-                )
+                format!("❌ Failed to verify Discord channel `{channel_id}`:\n{e}")
             }
         }
     }
@@ -224,15 +222,14 @@ impl AdminCommandHandler {
                         self.cache.m_custom_emojis.write().remove(room_id);
 
                         format!(
-                            "✅ Successfully unlinked Matrix room `{}` from Discord channel `{}`",
-                            room_id, channel_id
+                            "✅ Successfully unlinked Matrix room `{room_id}` from Discord channel `{channel_id}`"
                         )
                     }
-                    Err(e) => format!("Failed to remove bridge: {}", e),
+                    Err(e) => format!("Failed to remove bridge: {e}"),
                 }
             }
-            Ok(None) => format!("Matrix room `{}` is not bridged.", room_id),
-            Err(e) => format!("Database error: {}", e),
+            Ok(None) => format!("Matrix room `{room_id}` is not bridged."),
+            Err(e) => format!("Database error: {e}"),
         }
     }
 
@@ -253,8 +250,7 @@ impl AdminCommandHandler {
                             .matrix
                             .get_room_emojis(room_id)
                             .await
-                            .map(|e| e.len())
-                            .unwrap_or(0);
+                            .map_or(0, |e| e.len());
 
                         format!(
                             "**Bridge Status**\n\n\
@@ -273,17 +269,16 @@ impl AdminCommandHandler {
                     Err(e) => {
                         format!(
                             "**Bridge Status**\n\n\
-                            Matrix Room: `{}`\n\
-                            Discord Channel: `{}`\n\
+                            Matrix Room: `{room_id}`\n\
+                            Discord Channel: `{channel_id}`\n\
                             Status: ⚠️ Discord channel not accessible\n\
-                            Error: {}",
-                            room_id, channel_id, e
+                            Error: {e}"
                         )
                     }
                 }
             }
-            Ok(None) => format!("Matrix room `{}` is not bridged.", room_id),
-            Err(e) => format!("Database error: {}", e),
+            Ok(None) => format!("Matrix room `{room_id}` is not bridged."),
+            Err(e) => format!("Database error: {e}"),
         }
     }
 
@@ -318,13 +313,13 @@ impl AdminCommandHandler {
                 )
             }
             Err(e) => {
-                format!("❌ Failed to verify channel `{}`:\n{}", channel_id, e)
+                format!("❌ Failed to verify channel `{channel_id}`:\n{e}")
             }
         }
     }
 
     async fn verify_discord_channel(&self, channel_id: &str) -> crate::error::Result<ChannelInfo> {
-        let url = format!("https://discord.com/api/v10/channels/{}", channel_id);
+        let url = format!("https://discord.com/api/v10/channels/{channel_id}");
 
         let response = self
             .discord_http
@@ -336,21 +331,23 @@ impl AdminCommandHandler {
             .send()
             .await
             .map_err(|e| {
-                crate::error::BridgeError::Discord(serenity::Error::from(std::io::Error::other(
-                    e.to_string(),
+                crate::error::BridgeError::Discord(Box::new(serenity::Error::from(
+                    std::io::Error::other(e.to_string()),
                 )))
             })?;
 
         if !response.status().is_success() {
             let status = response.status();
             let error_text = response.text().await.unwrap_or_default();
-            return Err(crate::error::BridgeError::Discord(serenity::Error::from(
-                std::io::Error::other(format!("Discord API error {}: {}", status, error_text)),
+            return Err(crate::error::BridgeError::Discord(Box::new(
+                serenity::Error::from(std::io::Error::other(format!(
+                    "Discord API error {status}: {error_text}"
+                ))),
             )));
         }
 
         let channel_data: Value = response.json().await.map_err(|e| {
-            crate::error::BridgeError::Matrix(format!("Failed to parse Discord response: {}", e))
+            crate::error::BridgeError::Matrix(format!("Failed to parse Discord response: {e}"))
         })?;
 
         let channel_type = channel_data["type"].as_u64().unwrap_or(999);
@@ -367,6 +364,7 @@ impl AdminCommandHandler {
                 .unwrap_or("unknown")
                 .to_string(),
             guild_id: channel_data["guild_id"].as_str().map(String::from),
+            #[allow(clippy::cast_possible_truncation)]
             channel_type: channel_type as u8,
         })
     }
@@ -378,7 +376,7 @@ impl AdminCommandHandler {
 
         let invites = match self.db.list_invites().await {
             Ok(invs) => invs,
-            Err(e) => return format!("Database error: {}", e),
+            Err(e) => return format!("Database error: {e}"),
         };
 
         match args[0] {
@@ -387,17 +385,18 @@ impl AdminCommandHandler {
                     "No pending invites.".to_string()
                 } else {
                     let mut response = "**Pending Invites:**\n\n".to_string();
-                    for inv in invites.iter() {
+                    for inv in &invites {
                         let name_part = inv
                             .room_name
                             .as_deref()
-                            .map(|n| format!(" `{}`", n))
+                            .map(|n| format!(" `{n}`"))
                             .unwrap_or_default();
 
-                        response.push_str(&format!(
-                            "- **room**: \"{}\", **id**: \"{}\" (from `{}`)\n",
+                        let _ = writeln!(
+                            response,
+                            "- **room**: \"{}\", **id**: \"{}\" (from `{}`)",
                             name_part, inv.room_id, inv.sender
-                        ));
+                        );
                     }
                     response
                 }
@@ -418,7 +417,7 @@ impl AdminCommandHandler {
                 for &idx in &indices {
                     let invite = &invites[idx - 1];
                     match self.matrix.join_room(&invite.room_id, None).await {
-                        Ok(_) => {
+                        Ok(()) => {
                             let _ = self.db.remove_invite(invite.id).await;
                             success_count += 1;
                         }
@@ -428,7 +427,7 @@ impl AdminCommandHandler {
                     }
                 }
 
-                let mut resp = format!("Accepted {} invite(s).", success_count);
+                let mut resp = format!("Accepted {success_count} invite(s).");
                 if !err_msgs.is_empty() {
                     resp.push_str("\nErrors:\n");
                     resp.push_str(&err_msgs.join("\n"));
@@ -452,7 +451,7 @@ impl AdminCommandHandler {
                     let _ = self.db.remove_invite(invite.id).await;
                     success_count += 1;
                 }
-                format!("Deleted {} invite(s).", success_count)
+                format!("Deleted {success_count} invite(s).")
             }
             _ => "Unknown invite action. Use `list`, `accept`, or `delete`.".to_string(),
         }
@@ -470,10 +469,11 @@ impl AdminCommandHandler {
                         }
                     }
                 }
-            } else if let Ok(i) = part.trim().parse::<usize>() {
-                if i > 0 && i <= max_val {
-                    indices.insert(i);
-                }
+            } else if let Ok(i) = part.trim().parse::<usize>()
+                && i > 0
+                && i <= max_val
+            {
+                indices.insert(i);
             }
         }
         let mut result: Vec<usize> = indices.into_iter().collect();

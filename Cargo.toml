@@ -47,8 +47,8 @@ reqwest = { version = "0.13.3", features = ["json", "multipart"] }
 futures = "0.3.32"
 html-escape = "0.2.13"
 
-[profile.release]
-opt-level = 3
-lto = "fat"
-codegen-units = 1
-strip = true
+# [profile.release]
+# opt-level = 3
+# lto = "fat"
+# codegen-units = 1
+# strip = true

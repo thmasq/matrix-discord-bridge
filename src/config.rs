@@ -11,6 +11,7 @@ pub struct Config {
     pub discord_token: String,
     pub port: u16,
     pub database: PathBuf,
+    #[allow(clippy::struct_field_names)]
     pub config_room_id: Option<String>,
 }
 
