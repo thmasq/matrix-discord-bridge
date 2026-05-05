@@ -74,27 +74,26 @@ impl AdminCommandHandler {
     }
 
     fn cmd_help(&self) -> String {
-        r#"**Bridge Admin Commands**
-
-**!help** - Show this help message
-
-**!list** - List all current bridges
-
-**!link <matrix_room_id> <discord_channel_id>** - Create a new bridge
-  Example: `!link !abc123:matrix.org 123456789012345678`
-
-**!unlink <matrix_room_id>** - Remove a bridge
-  Example: `!unlink !abc123:matrix.org`
-
-**!status <matrix_room_id>** - Show bridge status for a room
-  Example: `!status !abc123:matrix.org`
-
-**!verify <discord_channel_id>** - Verify access to a Discord channel
-  Example: `!verify 123456789012345678`
-
-**!invite list** - List pending bot invites
-**!invite accept <id>** - Accept a pending invite
-**!invite delete <ids>** - Reject/delete invites (e.g., 2-4 or 5,6)"#
+        r#"### -- Bridge Admin Commands --
+> \-  **!help** - Show this help message
+> 
+> \-  **!list** - List all current bridges
+> 
+> \-  **!link** <_matrix\_room\_id_> <_discord\_channel\_id_> - Create a new bridge
+> Example: `!link !abc123:matrix.org 123456789012345678`
+> 
+> \-  **!unlink** <_matrix\_room\_id_> - Remove a bridge
+> Example: `!unlink !abc123:matrix.org`
+> 
+> \-  **!status** <_matrix\_room\_id_> - Show bridge status for a room
+> Example: `!status !abc123:matrix.org`
+> 
+> \-  **!verify** <_discord\_channel\_id_> - Verify if bot has access to a Discord channel
+> Example: `!verify 123456789012345678`
+> 
+> \-  **!invite list** - List pending bot invites
+> \-  **!invite accept** <id> - Accept a pending invite
+> \-  **!invite delete** <ids> - Reject/delete invites (e.g., 2-4 or 5,6)"#
             .to_string()
     }
 
@@ -377,85 +376,109 @@ impl AdminCommandHandler {
             return "Usage: `!invite <list|accept|delete> [args]`".to_string();
         }
 
+        let invites = match self.db.list_invites().await {
+            Ok(invs) => invs,
+            Err(e) => return format!("Database error: {}", e),
+        };
+
         match args[0] {
-            "list" => match self.db.list_invites().await {
-                Ok(invites) => {
-                    if invites.is_empty() {
-                        "No pending invites.".to_string()
-                    } else {
-                        let mut response = "**Pending Invites:**\n\n".to_string();
-                        for inv in invites {
-                            response.push_str(&format!(
-                                "`{}` - `{}` (from `{}`)\n",
-                                inv.id, inv.room_id, inv.sender
-                            ));
-                        }
-                        response
+            "list" => {
+                if invites.is_empty() {
+                    "No pending invites.".to_string()
+                } else {
+                    let mut response = "**Pending Invites:**\n\n".to_string();
+                    for inv in invites.iter() {
+                        let name_part = inv
+                            .room_name
+                            .as_deref()
+                            .map(|n| format!(" `{}`", n))
+                            .unwrap_or_default();
+
+                        response.push_str(&format!(
+                            "- **room**: \"{}\", **id**: \"{}\" (from `{}`)\n",
+                            name_part, inv.room_id, inv.sender
+                        ));
                     }
+                    response
                 }
-                Err(e) => format!("Database error: {}", e),
-            },
+            }
             "accept" => {
                 if args.len() < 2 {
-                    return "Usage: `!invite accept <id>`".to_string();
+                    return "Usage: `!invite accept <id_or_ranges>` (e.g. 1-3 or 4,5)".to_string();
                 }
-                if let Ok(id) = args[1].parse::<i64>() {
-                    match self.db.get_invite(id).await {
-                        Ok(Some(invite)) => {
-                            match self.matrix.join_room(&invite.room_id, None).await {
-                                Ok(_) => {
-                                    let _ = self.db.remove_invite(id).await;
-                                    format!("Accepted invite to `{}`", invite.room_id)
-                                }
-                                Err(e) => format!("❌ Failed to join room: {}", e),
-                            }
+
+                let indices = Self::parse_indices(&args[1..].join(""), invites.len());
+                if indices.is_empty() {
+                    return "No valid invites found for the given range.".to_string();
+                }
+
+                let mut success_count = 0;
+                let mut err_msgs = Vec::new();
+
+                for &idx in &indices {
+                    let invite = &invites[idx - 1];
+                    match self.matrix.join_room(&invite.room_id, None).await {
+                        Ok(_) => {
+                            let _ = self.db.remove_invite(invite.id).await;
+                            success_count += 1;
                         }
-                        Ok(None) => format!("Invite ID `{}` not found.", id),
-                        Err(e) => format!("Database error: {}", e),
+                        Err(e) => {
+                            err_msgs.push(format!("Failed to join {}: {}", invite.room_id, e));
+                        }
                     }
-                } else {
-                    "Invalid invite ID format.".to_string()
                 }
+
+                let mut resp = format!("Accepted {} invite(s).", success_count);
+                if !err_msgs.is_empty() {
+                    resp.push_str("\nErrors:\n");
+                    resp.push_str(&err_msgs.join("\n"));
+                }
+                resp
             }
             "delete" => {
                 if args.len() < 2 {
                     return "Usage: `!invite delete <id_or_ranges>` (e.g. 1-3 or 4,5)".to_string();
                 }
 
-                // Parse the input (e.g. ["2-4,", "5"] becomes "2-4,5")
-                let mut ids = std::collections::HashSet::new();
-                let input = args[1..].join("");
-
-                for part in input.split(',') {
-                    if let Some((start, end)) = part.split_once('-') {
-                        if let (Ok(s), Ok(e)) =
-                            (start.trim().parse::<i64>(), end.trim().parse::<i64>())
-                        {
-                            for id in s..=e {
-                                ids.insert(id);
-                            }
-                        }
-                    } else if let Ok(id) = part.trim().parse::<i64>() {
-                        ids.insert(id);
-                    }
-                }
-
-                if ids.is_empty() {
-                    return "No valid IDs provided.".to_string();
+                let indices = Self::parse_indices(&args[1..].join(""), invites.len());
+                if indices.is_empty() {
+                    return "No valid invites found for the given range.".to_string();
                 }
 
                 let mut success_count = 0;
-                for id in ids {
-                    if let Ok(Some(invite)) = self.db.get_invite(id).await {
-                        let _ = self.matrix.leave_room(&invite.room_id, None).await;
-                        let _ = self.db.remove_invite(id).await;
-                        success_count += 1;
-                    }
+                for &idx in &indices {
+                    let invite = &invites[idx - 1];
+                    let _ = self.matrix.leave_room(&invite.room_id, None).await;
+                    let _ = self.db.remove_invite(invite.id).await;
+                    success_count += 1;
                 }
                 format!("Deleted {} invite(s).", success_count)
             }
             _ => "Unknown invite action. Use `list`, `accept`, or `delete`.".to_string(),
         }
+    }
+
+    fn parse_indices(input: &str, max_val: usize) -> Vec<usize> {
+        let mut indices = std::collections::HashSet::new();
+        for part in input.split(',') {
+            if let Some((start, end)) = part.split_once('-') {
+                if let (Ok(s), Ok(e)) = (start.trim().parse::<usize>(), end.trim().parse::<usize>())
+                {
+                    for i in s..=e {
+                        if i > 0 && i <= max_val {
+                            indices.insert(i);
+                        }
+                    }
+                }
+            } else if let Ok(i) = part.trim().parse::<usize>() {
+                if i > 0 && i <= max_val {
+                    indices.insert(i);
+                }
+            }
+        }
+        let mut result: Vec<usize> = indices.into_iter().collect();
+        result.sort_unstable();
+        result
     }
 }
 

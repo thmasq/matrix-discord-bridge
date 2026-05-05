@@ -197,7 +197,24 @@ impl AppService {
         // If it's an event targeting our bot user
         if state_key == self.config.full_user_id() {
             if membership == "invite" {
-                self.db.add_invite(room_id, sender).await?;
+                // Extract room name from invite_room_state if available
+                let mut room_name = None;
+                if let Some(unsigned) = event.get("unsigned") {
+                    if let Some(invite_room_state) =
+                        unsigned.get("invite_room_state").and_then(|s| s.as_array())
+                    {
+                        for state in invite_room_state {
+                            if state.get("type").and_then(|t| t.as_str()) == Some("m.room.name") {
+                                room_name = state
+                                    .get("content")
+                                    .and_then(|c| c.get("name"))
+                                    .and_then(|n| n.as_str());
+                            }
+                        }
+                    }
+                }
+
+                self.db.add_invite(room_id, sender, room_name).await?;
 
                 // Notify admin config room
                 if let Some(config_room) = &self.config.config_room_id {

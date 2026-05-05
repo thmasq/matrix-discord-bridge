@@ -25,6 +25,7 @@ pub struct PendingInvite {
     pub id: i64,
     pub room_id: String,
     pub sender: String,
+    pub room_name: Option<String>,
 }
 
 impl Database {
@@ -59,7 +60,8 @@ impl Database {
             "CREATE TABLE IF NOT EXISTS invites (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 room_id TEXT NOT NULL UNIQUE,
-                sender TEXT NOT NULL
+                sender TEXT NOT NULL,
+                room_name TEXT
             )",
         )
         .execute(&pool)
@@ -142,30 +144,28 @@ impl Database {
         Ok(())
     }
 
-    pub async fn add_invite(&self, room_id: &str, sender: &str) -> crate::error::Result<()> {
-        sqlx::query("INSERT OR REPLACE INTO invites (room_id, sender) VALUES (?, ?)")
+    pub async fn add_invite(
+        &self,
+        room_id: &str,
+        sender: &str,
+        room_name: Option<&str>,
+    ) -> crate::error::Result<()> {
+        sqlx::query("INSERT OR REPLACE INTO invites (room_id, sender, room_name) VALUES (?, ?, ?)")
             .bind(room_id)
             .bind(sender)
+            .bind(room_name)
             .execute(&self.pool)
             .await?;
         Ok(())
     }
 
     pub async fn list_invites(&self) -> crate::error::Result<Vec<PendingInvite>> {
-        let invites = sqlx::query_as::<_, PendingInvite>("SELECT id, room_id, sender FROM invites")
-            .fetch_all(&self.pool)
-            .await?;
-        Ok(invites)
-    }
-
-    pub async fn get_invite(&self, id: i64) -> crate::error::Result<Option<PendingInvite>> {
-        let invite = sqlx::query_as::<_, PendingInvite>(
-            "SELECT id, room_id, sender FROM invites WHERE id = ?",
+        let invites = sqlx::query_as::<_, PendingInvite>(
+            "SELECT id, room_id, sender, room_name FROM invites ORDER BY id ASC",
         )
-        .bind(id)
-        .fetch_optional(&self.pool)
+        .fetch_all(&self.pool)
         .await?;
-        Ok(invite)
+        Ok(invites)
     }
 
     pub async fn remove_invite(&self, id: i64) -> crate::error::Result<()> {
