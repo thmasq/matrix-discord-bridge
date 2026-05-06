@@ -25,6 +25,7 @@ pub struct MatrixClient {
 }
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct MatrixEvent {
     pub event_id: String,
     pub sender: String,
@@ -32,6 +33,7 @@ pub struct MatrixEvent {
     pub formatted_body: Option<String>,
 }
 
+#[allow(dead_code)]
 impl MatrixClient {
     pub fn new(config: Config, db: Database, cache: Cache) -> Self {
         let https = hyper_tls::HttpsConnector::new();
@@ -374,6 +376,7 @@ impl MatrixClient {
         Ok(())
     }
 
+    #[allow(clippy::too_many_lines)]
     pub async fn process_for_matrix(
         &self,
         message: &str,

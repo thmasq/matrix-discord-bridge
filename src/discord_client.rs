@@ -18,6 +18,18 @@ use serenity::{
 use std::fmt::Write;
 use std::{collections::HashMap, sync::Arc};
 
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+pub struct AttachmentInfo {
+    pub url: String,
+    pub filename: String,
+    pub content_type: Option<String>,
+    pub size: u32,
+    pub width: Option<u32>,
+    pub height: Option<u32>,
+}
+
+#[allow(dead_code)]
 pub struct DiscordHandler {
     matrix: Arc<MatrixClient>,
     db: Database,
@@ -1250,14 +1262,4 @@ pub async fn create_discord_client(
         .await?;
 
     Ok(client)
-}
-
-#[derive(Debug, Clone)]
-pub struct AttachmentInfo {
-    pub url: String,
-    pub filename: String,
-    pub content_type: Option<String>,
-    pub size: u32,
-    pub width: Option<u32>,
-    pub height: Option<u32>,
 }

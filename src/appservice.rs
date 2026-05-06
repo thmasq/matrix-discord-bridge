@@ -59,7 +59,8 @@ impl AppService {
     }
 
     pub async fn run(self: Arc<Self>) -> anyhow::Result<()> {
-        if let Some(mut rx) = self.event_receiver.lock().await.take() {
+        let rx = self.event_receiver.lock().await.take();
+        if let Some(mut rx) = rx {
             let service = self.clone();
             tokio::spawn(async move {
                 tracing::info!("Started background event processor task");

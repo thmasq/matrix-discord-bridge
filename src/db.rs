@@ -13,6 +13,7 @@ pub struct BridgedRoom {
 }
 
 #[derive(Debug, sqlx::FromRow)]
+#[allow(dead_code)]
 pub struct BridgedUser {
     pub mxid: String,
     pub avatar_url: Option<String>,
