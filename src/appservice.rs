@@ -13,7 +13,10 @@ use hyper_util::rt::TokioIo;
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::net::TcpListener;
+use tokio::{
+    net::TcpListener,
+    sync::{Mutex, mpsc},
+};
 
 pub struct AppService {
     config: Config,
@@ -22,6 +25,8 @@ pub struct AppService {
     cache: Cache,
     discord_http: reqwest::Client,
     admin_handler: AdminCommandHandler,
+    event_sender: mpsc::Sender<Value>,
+    event_receiver: Mutex<Option<mpsc::Receiver<Value>>>,
 }
 
 impl AppService {
@@ -39,6 +44,8 @@ impl AppService {
             discord_http.clone(),
         );
 
+        let (tx, rx) = mpsc::channel(10000);
+
         Self {
             config,
             matrix,
@@ -46,10 +53,24 @@ impl AppService {
             cache,
             discord_http,
             admin_handler,
+            event_sender: tx,
+            event_receiver: Mutex::new(Some(rx)),
         }
     }
 
     pub async fn run(self: Arc<Self>) -> anyhow::Result<()> {
+        if let Some(mut rx) = self.event_receiver.lock().await.take() {
+            let service = self.clone();
+            tokio::spawn(async move {
+                tracing::info!("Started background event processor task");
+                while let Some(event) = rx.recv().await {
+                    if let Err(e) = service.handle_event(&event).await {
+                        tracing::error!("Error handling event: {}", e);
+                    }
+                }
+            });
+        }
+
         let addr = format!("0.0.0.0:{}", self.config.port);
         let listener = TcpListener::bind(&addr).await?;
         tracing::info!("Appservice listening on {}", addr);
@@ -153,8 +174,8 @@ impl AppService {
 
         // Process events
         for event in events {
-            if let Err(e) = self.handle_event(event).await {
-                tracing::error!("Error handling event: {}", e);
+            if let Err(e) = self.event_sender.send(event.clone()).await {
+                tracing::error!("Failed to enqueue event: {}", e);
             }
         }
 
@@ -568,7 +589,22 @@ impl AppService {
             .as_str()
             .ok_or_else(|| BridgeError::Matrix("Media message missing url field".to_string()))?;
 
-        let body = content["body"].as_str().unwrap_or("attachment");
+        let original_body = content["body"].as_str().unwrap_or("attachment");
+
+        let is_msc4193_spoiler = content["page.codeberg.everypizza.msc4193.spoiler"]
+            .as_bool()
+            .unwrap_or(false);
+
+        let is_spoiler = original_body.starts_with("SPOILER_")
+            || original_body.starts_with("spoiler_")
+            || is_msc4193_spoiler;
+
+        let mut filename = original_body.to_string();
+        if is_spoiler && !filename.starts_with("SPOILER_") {
+            filename = format!("SPOILER_{}", original_body.trim_start_matches("spoiler_"));
+        }
+
+        let message_content = "";
 
         // Download from Matrix
         let media_data = self.matrix.download_media(url).await?;
@@ -587,8 +623,9 @@ impl AppService {
             .and_then(|mxc| self.matrix.mxc_to_http(mxc));
 
         tracing::info!(
-            "Forwarding {} from {} to Discord channel {}",
+            "Forwarding {} (Spoiler: {}) from {} to Discord channel {}",
             msgtype,
+            is_spoiler,
             sender,
             channel_id
         );
@@ -600,10 +637,10 @@ impl AppService {
         let discord_msg_id = self
             .send_webhook_with_file(
                 &webhook,
-                body,
+                message_content,
                 display_name,
                 avatar_url.as_deref(),
-                body,
+                &filename,
                 &media_data,
             )
             .await?;

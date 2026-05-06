@@ -87,6 +87,18 @@ impl Database {
         Ok(result)
     }
 
+    pub async fn get_room_by_channel(
+        &self,
+        channel_id: &str,
+    ) -> crate::error::Result<Option<String>> {
+        let result =
+            sqlx::query_scalar::<_, String>("SELECT room_id FROM bridge WHERE channel_id = ?")
+                .bind(channel_id)
+                .fetch_optional(&self.pool)
+                .await?;
+        Ok(result)
+    }
+
     pub async fn list_channels(&self) -> crate::error::Result<Vec<String>> {
         let channels = sqlx::query_scalar::<_, String>("SELECT channel_id FROM bridge")
             .fetch_all(&self.pool)

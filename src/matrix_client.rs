@@ -8,14 +8,18 @@ use crate::{
 use http_body_util::{BodyExt, Full};
 use hyper::{Method, Request as HyperRequest, Uri, body::Bytes};
 use hyper_util::client::legacy::{Client, connect::HttpConnector};
+use pulldown_cmark::TagEnd;
+use pulldown_cmark::{Event, Options, Parser, Tag, html};
 use ruma::{OwnedRoomId, events::room::message::RoomMessageEventContent};
 use serde_json::{Value, json};
-use std::collections::HashMap;
 use std::fmt::Write;
+use std::{collections::HashMap, sync::OnceLock};
+
+static EMOTE_REGEX: OnceLock<regex::Regex> = OnceLock::new();
 
 pub struct MatrixClient {
     config: Config,
-    http_client: Client<HttpConnector, Full<Bytes>>,
+    http_client: Client<hyper_tls::HttpsConnector<HttpConnector>, Full<Bytes>>,
     db: Database,
     cache: Cache,
 }
@@ -30,7 +34,8 @@ pub struct MatrixEvent {
 
 impl MatrixClient {
     pub fn new(config: Config, db: Database, cache: Cache) -> Self {
-        let http_client = Client::builder(hyper_util::rt::TokioExecutor::new()).build_http();
+        let https = hyper_tls::HttpsConnector::new();
+        let http_client = Client::builder(hyper_util::rt::TokioExecutor::new()).build(https);
 
         Self {
             config,
@@ -47,7 +52,7 @@ impl MatrixClient {
         body: Option<Value>,
         user_id: Option<&str>,
     ) -> Result<Value> {
-        let mut url = format!("{}/_matrix/client/r0{}", self.config.homeserver, path);
+        let mut url = format!("{}/_matrix/client/v3{}", self.config.homeserver, path);
 
         if let Some(uid) = user_id {
             let _ = write!(url, "?user_id={}", urlencoding::encode(uid));
@@ -217,24 +222,59 @@ impl MatrixClient {
             .map_err(|e| BridgeError::Matrix(format!("Invalid avatar URL '{url}': {e}")))?;
 
         let req = HyperRequest::builder()
+            .method(Method::GET)
             .uri(uri)
             .body(Full::new(Bytes::new()))
             .unwrap();
 
         let res = self.http_client.request(req).await?;
+
+        if res.status() != hyper::StatusCode::OK {
+            return Err(BridgeError::Matrix(format!(
+                "Failed to download media from URL: {}",
+                res.status()
+            )));
+        }
+
         let bytes = res.collect().await?.to_bytes();
 
-        // Upload to homeserver
-        let upload_url = format!("{}/_matrix/media/r0/upload", self.config.homeserver);
-        let req = HyperRequest::builder()
+        let content_type = if std::path::Path::new(url)
+            .extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("gif"))
+        {
+            "image/gif"
+        } else if std::path::Path::new(url)
+            .extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("webp"))
+        {
+            "image/webp"
+        } else if std::path::Path::new(url)
+            .extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("jpg") || ext.eq_ignore_ascii_case("jpeg"))
+        {
+            "image/jpeg"
+        } else {
+            "image/png"
+        };
+
+        let upload_url = format!("{}/_matrix/media/v3/upload", self.config.homeserver);
+        let upload_req = HyperRequest::builder()
             .method(Method::POST)
             .uri(upload_url)
             .header("Authorization", format!("Bearer {}", self.config.as_token))
-            .header("Content-Type", "application/octet-stream")
+            .header("Content-Type", content_type)
             .body(Full::new(bytes))
             .unwrap();
 
-        let res = self.http_client.request(req).await?;
+        let res = self.http_client.request(upload_req).await?;
+
+        if res.status() != hyper::StatusCode::OK {
+            return Err(BridgeError::Matrix(format!(
+                "Failed to upload media: {}",
+                res.status()
+            )));
+        }
+
         let body = res.collect().await?.to_bytes();
         let json: Value = serde_json::from_slice(&body)?;
 
@@ -252,7 +292,7 @@ impl MatrixClient {
         }
 
         Some(format!(
-            "https://{}/_matrix/media/r0/download/{}/{}",
+            "https://{}/_matrix/client/v1/media/download/{}/{}",
             self.config.server_name, parts[0], parts[1]
         ))
     }
@@ -339,61 +379,132 @@ impl MatrixClient {
         message: &str,
         emotes: &HashMap<String, String>,
     ) -> (String, String) {
-        use pulldown_cmark::{Options, Parser, html};
+        let mut resolved_emotes = HashMap::new();
+        let emote_regex =
+            EMOTE_REGEX.get_or_init(|| regex::Regex::new(r":([a-zA-Z0-9_]+):").unwrap());
 
-        // Convert markdown to HTML
+        for cap in emote_regex.captures_iter(message) {
+            let emote_name = cap.get(1).unwrap().as_str();
+
+            if let Some(emote_id) = emotes.get(emote_name) {
+                if resolved_emotes.contains_key(emote_name) {
+                    continue;
+                }
+
+                let emote_url = format!("https://cdn.discordapp.com/emojis/{emote_id}.png");
+
+                let mxc_url = {
+                    let cache = self.cache.m_emotes.read();
+                    cache.get(emote_name).cloned()
+                };
+
+                let mxc_url = if let Some(mxc) = mxc_url {
+                    mxc
+                } else {
+                    match self.upload_from_url(&emote_url).await {
+                        Ok(mxc) => {
+                            self.cache
+                                .m_emotes
+                                .write()
+                                .insert(emote_name.to_string(), mxc.clone());
+                            mxc
+                        }
+                        Err(e) => {
+                            tracing::warn!("Failed to upload emote {}: {}", emote_name, e);
+                            continue;
+                        }
+                    }
+                };
+                resolved_emotes.insert(emote_name.to_string(), mxc_url);
+            }
+        }
+
         let mut options = Options::empty();
         options.insert(Options::ENABLE_STRIKETHROUGH);
         options.insert(Options::ENABLE_TABLES);
 
-        let parser = Parser::new_ext(message, options);
+        let mut in_code_block = false;
+        let mut in_spoiler = false;
+
+        let parser = Parser::new_ext(message, options).flat_map(|event| {
+            let mut events = Vec::new();
+
+            match event {
+                Event::Start(Tag::CodeBlock(_)) => {
+                    in_code_block = true;
+                    events.push(event);
+                }
+                Event::End(TagEnd::CodeBlock) => {
+                    in_code_block = false;
+                    events.push(event);
+                }
+                Event::Code(_) => {
+                    events.push(event);
+                }
+                Event::SoftBreak => {
+                    events.push(Event::HardBreak);
+                }
+                Event::Text(text) if !in_code_block => {
+                    for (i, part) in text.split("||").enumerate() {
+                        if i > 0 {
+                            if in_spoiler {
+                                events.push(Event::Html("</span>".into()));
+                                in_spoiler = false;
+                            } else {
+                                events.push(Event::Html("<span data-mx-spoiler>".into()));
+                                in_spoiler = true;
+                            }
+                        }
+
+                        if !part.is_empty() {
+                            let mut last_end = 0;
+                            for cap in emote_regex.captures_iter(part) {
+                                let mat = cap.get(0).unwrap();
+                                let emote_name = cap.get(1).unwrap().as_str();
+
+                                if let Some(mxc_url) = resolved_emotes.get(emote_name) {
+                                    if mat.start() > last_end {
+                                        events.push(Event::Text(part[last_end..mat.start()].to_string().into()));
+                                    }
+                                    let emote_html = format!(
+                                        r#"<img alt=":{emote_name}:" title=":{emote_name}:" height="32" src="{mxc_url}" data-mx-emoticon />"#
+                                    );
+                                    events.push(Event::Html(emote_html.into()));
+                                    last_end = mat.end();
+                                }
+                            }
+                            if last_end < part.len() {
+                                events.push(Event::Text(part[last_end..].to_string().into()));
+                            }
+                        }
+                    }
+                }
+                _ => events.push(event),
+            }
+            events.into_iter()
+        });
+
         let mut html_output = String::new();
         html::push_html(&mut html_output, parser);
 
-        // Clean up HTML
-        let html_output = html_output
-            .trim_start_matches("<p>")
-            .trim_end_matches("</p>")
-            .replace('\n', "<br />");
-
-        // Process emotes
-        let mut formatted = html_output.clone();
-
-        for (emote_name, emote_id) in emotes {
-            let emote_url = format!("https://cdn.discordapp.com/emojis/{emote_id}.png");
-
-            // Try to get from cache or upload
-            let mxc_url = {
-                let cache = self.cache.m_emotes.read();
-                cache.get(emote_name).cloned()
-            };
-
-            let mxc_url = if let Some(mxc) = mxc_url {
-                mxc
-            } else {
-                match self.upload_from_url(&emote_url).await {
-                    Ok(mxc) => {
-                        self.cache
-                            .m_emotes
-                            .write()
-                            .insert(emote_name.clone(), mxc.clone());
-                        mxc
-                    }
-                    Err(e) => {
-                        tracing::warn!("Failed to upload emote {}: {}", emote_name, e);
-                        continue;
-                    }
-                }
-            };
-
-            let emote_html = format!(
-                r#"<img alt=":{emote_name}:" title=":{emote_name}:" height="32" src="{mxc_url}" data-mx-emoticon />"#
-            );
-
-            formatted = formatted.replace(&format!(":{emote_name}:"), &emote_html);
+        if in_spoiler {
+            html_output.push_str("</span>");
         }
 
-        // Return plain and formatted versions
+        let mut formatted = html_output.trim().to_string();
+        if formatted.starts_with("<p>")
+            && formatted.ends_with("</p>")
+            && formatted.matches("<p>").count() == 1
+        {
+            formatted = formatted
+                .strip_prefix("<p>")
+                .unwrap()
+                .strip_suffix("</p>")
+                .unwrap()
+                .trim()
+                .to_string();
+        }
+
         (message.to_string(), formatted)
     }
 
@@ -508,8 +619,7 @@ impl MatrixClient {
         let res = self.http_client.request(req).await?;
         let bytes = res.collect().await?.to_bytes();
 
-        // Upload to homeserver
-        let upload_url = format!("{}/_matrix/media/r0/upload", self.config.homeserver);
+        let upload_url = format!("{}/_matrix/media/v3/upload", self.config.homeserver);
 
         let mut upload_req = HyperRequest::builder()
             .method(Method::POST)
@@ -526,6 +636,14 @@ impl MatrixClient {
         let upload_req = upload_req.body(Full::new(bytes.clone())).unwrap();
 
         let res = self.http_client.request(upload_req).await?;
+
+        if res.status() != hyper::StatusCode::OK {
+            return Err(BridgeError::Matrix(format!(
+                "Failed to upload attachment: {}",
+                res.status()
+            )));
+        }
+
         let body = res.collect().await?.to_bytes();
         let upload_resp: Value = serde_json::from_slice(&body)?;
         let mxc_url = upload_resp["content_uri"].as_str().unwrap();
@@ -533,12 +651,18 @@ impl MatrixClient {
         // Determine message type based on content type
         let (msgtype, extra_info) = Self::determine_media_type(attachment, mxc_url, bytes.len());
 
-        let content = json!({
+        let mut content = json!({
             "msgtype": msgtype,
             "body": attachment.filename,
             "url": mxc_url,
             "info": extra_info
         });
+
+        if attachment.filename.starts_with("SPOILER_")
+            || attachment.filename.starts_with("spoiler_")
+        {
+            content["page.codeberg.everypizza.msc4193.spoiler"] = json!(true);
+        }
 
         let txn_id = uuid::Uuid::new_v4();
         let resp = self
@@ -613,7 +737,7 @@ impl MatrixClient {
         }
 
         let download_url = format!(
-            "{}/_matrix/media/r0/download/{}/{}",
+            "{}/_matrix/client/v1/media/download/{}/{}",
             self.config.homeserver, parts[0], parts[1]
         );
 
@@ -797,8 +921,7 @@ impl MatrixClient {
             "image/png"
         };
 
-        // Upload to homeserver
-        let upload_url = format!("{}/_matrix/media/r0/upload", self.config.homeserver);
+        let upload_url = format!("{}/_matrix/media/v3/upload", self.config.homeserver);
         let upload_req = HyperRequest::builder()
             .method(Method::POST)
             .uri(upload_url)
@@ -808,6 +931,14 @@ impl MatrixClient {
             .unwrap();
 
         let res = self.http_client.request(upload_req).await?;
+
+        if res.status() != hyper::StatusCode::OK {
+            return Err(BridgeError::Matrix(format!(
+                "Failed to upload sticker: {}",
+                res.status()
+            )));
+        }
+
         let body = res.collect().await?.to_bytes();
         let upload_resp: Value = serde_json::from_slice(&body)?;
         let mxc_url = upload_resp["content_uri"].as_str().unwrap();

@@ -346,18 +346,27 @@ impl DiscordHandler {
             }
         }
 
-        // Try to resolve via Matrix API
-        match self.matrix.resolve_room_alias(&room_alias).await {
-            Ok(room_id) => {
-                // Cache it
+        match self.db.get_room_by_channel(channel_id).await {
+            Ok(Some(room_id)) => {
                 self.cache
                     .m_rooms
                     .write()
                     .insert(room_alias, room_id.clone());
                 Some(room_id)
             }
+            Ok(None) => {
+                tracing::debug!(
+                    "No Matrix room found in database for Discord channel {}",
+                    channel_id
+                );
+                None
+            }
             Err(e) => {
-                tracing::debug!("Could not resolve room alias {}: {}", room_alias, e);
+                tracing::error!(
+                    "Database error resolving room for channel {}: {}",
+                    channel_id,
+                    e
+                );
                 None
             }
         }
