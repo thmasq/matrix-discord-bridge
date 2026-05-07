@@ -1112,11 +1112,9 @@ impl EventHandler for DiscordHandler {
         // Convert reaction emoji to string
         let reaction_key = match &reaction.emoji {
             ReactionType::Unicode(emoji) => emoji.clone(),
-            ReactionType::Custom { name, id, .. } => {
-                // For custom emojis, use :name: format
-                name.as_ref()
-                    .map_or_else(|| format!(":custom_{id}:"), |n| format!(":{n}:"))
-            }
+            ReactionType::Custom { name, id, .. } => name
+                .as_ref()
+                .map_or_else(|| format!("custom_{id}"), |n| n.clone()),
             _ => {
                 tracing::debug!("Unknown reaction type");
                 return;
@@ -1189,7 +1187,7 @@ impl EventHandler for DiscordHandler {
             ReactionType::Unicode(emoji) => emoji.clone(),
             ReactionType::Custom { name, id, .. } => name
                 .as_ref()
-                .map_or_else(|| format!(":custom_{id}:"), |n| format!(":{n}:")),
+                .map_or_else(|| format!("custom_{id}"), |n| n.clone()),
             _ => return,
         };
 

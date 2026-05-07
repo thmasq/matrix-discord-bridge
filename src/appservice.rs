@@ -345,18 +345,19 @@ impl AppService {
 
         // Check if room is bridged
         if let Some(bridge) = self.db.get_bridge(room_id).await?
-            && bridge.m2d_enabled {
-                return self
-                    .forward_message_to_discord(
-                        room_id,
-                        sender,
-                        event_id,
-                        content,
-                        &bridge.channel_id,
-                        msgtype,
-                    )
-                    .await;
-            }
+            && bridge.m2d_enabled
+        {
+            return self
+                .forward_message_to_discord(
+                    room_id,
+                    sender,
+                    event_id,
+                    content,
+                    &bridge.channel_id,
+                    msgtype,
+                )
+                .await;
+        }
 
         Ok(())
     }
@@ -935,19 +936,17 @@ impl AppService {
         }
         let channel_id = bridge.channel_id;
 
-        // Convert Matrix reaction to Discord emoji
-        // For custom emojis in :name: format, look them up in cache
-        let discord_emoji = if reaction_key.starts_with(':') && reaction_key.ends_with(':') {
-            let name = reaction_key.trim_matches(':');
+        let clean_name = reaction_key.trim_matches(':');
 
-            // Extract just the emoji ID from the Discord format
-            self.cache.d_emotes.get(name).map_or_else(
+        let discord_emoji = if let Some(discord_format) = self.cache.d_emotes.get(clean_name) {
+            let id_regex = ID_REGEX.get_or_init(|| regex::Regex::new(r":(\d+)>$").unwrap());
+            id_regex.captures(&discord_format).map_or_else(
                 || urlencoding::encode(reaction_key).to_string(),
-                |discord_format| {
-                    let id_regex = ID_REGEX.get_or_init(|| regex::Regex::new(r":(\d+)>$").unwrap());
-                    id_regex.captures(&discord_format).map_or_else(
-                        || urlencoding::encode(reaction_key).to_string(),
-                        |cap| format!("{}:{}", name, cap.get(1).unwrap().as_str()),
+                |cap| {
+                    format!(
+                        "{}%3A{}",
+                        urlencoding::encode(clean_name),
+                        cap.get(1).unwrap().as_str()
                     )
                 },
             )
