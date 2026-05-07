@@ -15,8 +15,9 @@ use serenity::{
         guild::{Guild, Member},
     },
 };
-use std::fmt::Write;
 use std::{collections::HashMap, sync::Arc};
+use std::{fmt::Write, hash::Hasher};
+use twox_hash::XxHash32;
 
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
@@ -50,6 +51,12 @@ impl DiscordHandler {
             cache,
             config,
         }
+    }
+
+    fn hash_webhook_name(s: &str) -> u64 {
+        let mut hasher = XxHash32::with_seed(0);
+        hasher.write(s.as_bytes());
+        hasher.finish()
     }
 
     fn get_discriminator(user: &serenity::model::user::User) -> u16 {
@@ -277,7 +284,7 @@ impl DiscordHandler {
         let hashed = if message.webhook_id.is_some() {
             Some(format!(
                 "{:x}",
-                crate::utils::hash_string(&message.author.name)
+                Self::hash_webhook_name(&message.author.name)
             ))
         } else {
             None

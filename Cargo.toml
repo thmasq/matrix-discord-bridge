@@ -47,6 +47,7 @@ reqwest = { version = "0.13.3", features = ["json", "multipart"] }
 futures = "0.3.32"
 html-escape = "0.2.13"
 hyper-tls = "0.6.0"
+twox-hash = "2.1.2"
 
 # [profile.release]
 # opt-level = 3

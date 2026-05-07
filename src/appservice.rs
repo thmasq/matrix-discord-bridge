@@ -1,6 +1,6 @@
 use crate::{
     admin_commands::AdminCommandHandler, cache::Cache, config::Config, db::Database,
-    error::BridgeError, matrix_client::MatrixClient, utils::DISCORD_MESSAGE_LIMIT,
+    error::BridgeError, matrix_client::MatrixClient,
 };
 use http_body_util::{BodyExt, Full};
 use hyper::{
@@ -17,6 +17,8 @@ use tokio::{
     net::TcpListener,
     sync::{Mutex, mpsc},
 };
+
+const DISCORD_MESSAGE_LIMIT: usize = 2000;
 
 pub struct AppService {
     config: Config,
