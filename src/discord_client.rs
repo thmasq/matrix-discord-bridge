@@ -383,7 +383,7 @@ impl DiscordHandler {
 
     fn is_bridge_webhook(&self, message: &Message) -> bool {
         if let Some(webhook_id) = message.webhook_id {
-            for (_key, info) in self.cache.d_webhooks.iter() {
+            for (_key, info) in &self.cache.d_webhooks {
                 if info.id == webhook_id.to_string() {
                     return true;
                 }

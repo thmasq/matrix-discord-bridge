@@ -52,58 +52,58 @@ impl Default for Cache {
         Self {
             m_rooms: MokaCache::builder()
                 .max_capacity(10_000)
-                .time_to_idle(Duration::from_secs(86400 * 7)) // 1 week
+                .time_to_idle(Duration::from_hours(168)) // 1 week
                 .build(),
 
             m_members: MokaCache::builder()
                 .max_capacity(1_000)
-                .time_to_idle(Duration::from_secs(3600)) // 1 hour idle (members change)
+                .time_to_idle(Duration::from_hours(1)) // 1 hour idle (members change)
                 .build(),
 
             m_messages: MokaCache::builder()
                 .max_capacity(50_000)
-                .time_to_idle(Duration::from_secs(86400 * 7))
+                .time_to_idle(Duration::from_hours(168))
                 .build(),
 
             d_messages: MokaCache::builder()
                 .max_capacity(50_000)
-                .time_to_idle(Duration::from_secs(86400 * 7))
+                .time_to_idle(Duration::from_hours(168))
                 .build(),
 
             d_emotes: MokaCache::builder()
                 .max_capacity(10_000)
-                .time_to_idle(Duration::from_secs(86400 * 7))
+                .time_to_idle(Duration::from_hours(168))
                 .build(),
 
             m_emotes: MokaCache::builder()
                 .max_capacity(10_000)
-                .time_to_idle(Duration::from_secs(86400 * 7))
+                .time_to_idle(Duration::from_hours(168))
                 .build(),
 
             d_webhooks: MokaCache::builder()
                 .max_capacity(1_000)
-                .time_to_idle(Duration::from_secs(86400))
+                .time_to_idle(Duration::from_hours(24))
                 .build(),
 
             m_custom_emojis: MokaCache::builder()
                 .max_capacity(1_000)
-                .time_to_idle(Duration::from_secs(86400))
+                .time_to_idle(Duration::from_hours(24))
                 .build(),
 
             d_roles: MokaCache::builder()
                 .max_capacity(1_000)
-                .time_to_idle(Duration::from_secs(86400))
+                .time_to_idle(Duration::from_hours(24))
                 .build(),
 
             d_channels: MokaCache::builder()
                 .max_capacity(1_000)
-                .time_to_idle(Duration::from_secs(86400))
+                .time_to_idle(Duration::from_hours(24))
                 .build(),
 
             m_avatars: MokaCache::builder()
                 .weigher(|_key, value: &Vec<u8>| value.len().try_into().unwrap_or(u32::MAX))
                 .max_capacity(50 * 1024 * 1024) // 50 MB max memory limit
-                .time_to_idle(Duration::from_secs(86400))
+                .time_to_idle(Duration::from_hours(24))
                 .build(),
         }
     }
@@ -147,7 +147,7 @@ impl Cache {
         self.m_custom_emojis.invalidate(room_id);
 
         let mut aliases_to_remove = Vec::new();
-        for (alias, id) in self.m_rooms.iter() {
+        for (alias, id) in &self.m_rooms {
             if id == room_id {
                 aliases_to_remove.push(alias.clone());
             }

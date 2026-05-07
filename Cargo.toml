@@ -52,8 +52,8 @@ pulldown-cmark = "0.13.3"
 reqwest = { version = "0.13.3", features = ["json", "multipart", "stream"] }
 moka = { version = "0.12.15", features = ["logging", "sync"] }
 
-# [profile.release]
-# opt-level = 3
-# lto = "fat"
-# codegen-units = 1
-# strip = true
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+strip = true

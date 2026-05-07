@@ -355,7 +355,7 @@ impl MatrixClient {
     pub async fn resolve_room_alias(&self, alias: &str) -> Result<String> {
         // Check cache first
         if let Some(room_id) = self.cache.m_rooms.get(alias) {
-            return Ok(room_id.clone());
+            return Ok(room_id);
         }
 
         // Query homeserver
@@ -430,7 +430,7 @@ impl MatrixClient {
 
                 let emote_url = format!("https://cdn.discordapp.com/emojis/{emote_id}.png");
 
-                let mxc_url = self.cache.m_emotes.get(emote_name).map(|r| r);
+                let mxc_url = self.cache.m_emotes.get(emote_name);
 
                 let mxc_url = if let Some(mxc) = mxc_url {
                     mxc
@@ -927,7 +927,7 @@ impl MatrixClient {
     pub async fn get_room_emojis(&self, room_id: &str) -> Result<HashMap<String, String>> {
         // Check cache first
         if let Some(emojis) = self.cache.m_custom_emojis.get(room_id) {
-            return Ok(emojis.clone());
+            return Ok(emojis);
         }
 
         // Fetch and cache
@@ -1034,10 +1034,10 @@ impl MatrixClient {
 
     pub async fn is_user_in_room(&self, room_id: &str, mxid: &str) -> Result<bool> {
         // First check the cache
-        if let Some(room_members) = self.cache.m_members.get(room_id) {
-            if room_members.contains_key(mxid) {
-                return Ok(true);
-            }
+        if let Some(room_members) = self.cache.m_members.get(room_id)
+            && room_members.contains_key(mxid)
+        {
+            return Ok(true);
         }
 
         // If not in cache, query the homeserver
@@ -1102,9 +1102,8 @@ impl MatrixClient {
             return false;
         }
 
-        match uri.host() {
-            Some(host) => host == "cdn.discordapp.com" || host == "media.discordapp.net",
-            None => false,
-        }
+        uri.host().is_some_and(|host| {
+            host == "cdn.discordapp.com" || host == "media.discordapp.net"
+        })
     }
 }

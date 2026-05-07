@@ -171,11 +171,11 @@ impl AppService {
             .and_then(|h| h.to_str().ok())
             .and_then(|s| s.strip_prefix("Bearer "));
 
-        let query_valid = token_query.map_or(false, |t| {
+        let query_valid = token_query.is_some_and(|t| {
             constant_time_eq::constant_time_eq(t.as_bytes(), self.config.hs_token.as_bytes())
         });
 
-        let header_valid = token_header.map_or(false, |t| {
+        let header_valid = token_header.is_some_and(|t| {
             constant_time_eq::constant_time_eq(t.as_bytes(), self.config.hs_token.as_bytes())
         });
 
@@ -579,10 +579,10 @@ impl AppService {
         {
             let emote_regex = regex::Regex::new(r":(\w+):").unwrap();
             for cap in emote_regex.captures_iter(body) {
-                if let Some(name) = cap.get(1) {
-                    if let Some(discord_emote) = self.cache.d_emotes.get(name.as_str()) {
-                        processed_body = processed_body.replace(&cap[0], &discord_emote);
-                    }
+                if let Some(name) = cap.get(1)
+                    && let Some(discord_emote) = self.cache.d_emotes.get(name.as_str())
+                {
+                    processed_body = processed_body.replace(&cap[0], &discord_emote);
                 }
             }
         }
@@ -775,10 +775,10 @@ impl AppService {
         {
             let emote_regex = regex::Regex::new(r":(\w+):").unwrap();
             for cap in emote_regex.captures_iter(body) {
-                if let Some(name) = cap.get(1) {
-                    if let Some(discord_emote) = self.cache.d_emotes.get(name.as_str()) {
-                        processed_body = processed_body.replace(&cap[0], &discord_emote);
-                    }
+                if let Some(name) = cap.get(1)
+                    && let Some(discord_emote) = self.cache.d_emotes.get(name.as_str())
+                {
+                    processed_body = processed_body.replace(&cap[0], &discord_emote);
                 }
             }
         }
@@ -817,7 +817,7 @@ impl AppService {
     ) -> crate::error::Result<HashMap<String, crate::cache::MatrixUser>> {
         // Check cache first
         if let Some(cached) = self.cache.m_members.get(room_id) {
-            return Ok(cached.clone());
+            return Ok(cached);
         }
 
         // Fetch from homeserver
@@ -944,15 +944,16 @@ impl AppService {
             let name = reaction_key.trim_matches(':');
 
             // Extract just the emoji ID from the Discord format
-            if let Some(discord_format) = self.cache.d_emotes.get(name) {
-                let id_regex = regex::Regex::new(r":(\d+)>$").unwrap();
-                id_regex.captures(&discord_format).map_or_else(
-                    || urlencoding::encode(reaction_key).to_string(),
-                    |cap| format!("{}:{}", name, cap.get(1).unwrap().as_str()),
-                )
-            } else {
-                urlencoding::encode(reaction_key).to_string()
-            }
+            self.cache.d_emotes.get(name).map_or_else(
+                || urlencoding::encode(reaction_key).to_string(),
+                |discord_format| {
+                    let id_regex = regex::Regex::new(r":(\d+)>$").unwrap();
+                    id_regex.captures(&discord_format).map_or_else(
+                        || urlencoding::encode(reaction_key).to_string(),
+                        |cap| format!("{}:{}", name, cap.get(1).unwrap().as_str()),
+                    )
+                },
+            )
         } else {
             // Unicode emoji
             urlencoding::encode(reaction_key).to_string()
@@ -1059,7 +1060,7 @@ impl AppService {
         if let Some(info) = self.cache.d_webhooks.get(channel_id) {
             return Ok(WebhookData {
                 id: info.id.clone(),
-                token: info.token.clone(),
+                token: info.token,
             });
         }
 
@@ -1375,14 +1376,11 @@ impl AppService {
                 .unwrap());
         };
 
-        let exp_ts = match exp_str.parse::<u64>() {
-            Ok(ts) => ts,
-            Err(_) => {
-                return Ok(Response::builder()
-                    .status(StatusCode::BAD_REQUEST)
-                    .body(Full::new(Bytes::from("Invalid expiry format")))
-                    .unwrap());
-            }
+        let Ok(exp_ts) = exp_str.parse::<u64>() else {
+            return Ok(Response::builder()
+                .status(StatusCode::BAD_REQUEST)
+                .body(Full::new(Bytes::from("Invalid expiry format")))
+                .unwrap());
         };
 
         let now = SystemTime::now()
@@ -1414,14 +1412,11 @@ impl AppService {
                 .unwrap());
         };
 
-        let provided_sig_bytes = match hex::decode(provided_sig_hex) {
-            Ok(b) => b,
-            Err(_) => {
-                return Ok(Response::builder()
-                    .status(StatusCode::BAD_REQUEST)
-                    .body(Full::new(Bytes::from("Invalid signature format")))
-                    .unwrap());
-            }
+        let Ok(provided_sig_bytes) = hex::decode(provided_sig_hex) else {
+            return Ok(Response::builder()
+                .status(StatusCode::BAD_REQUEST)
+                .body(Full::new(Bytes::from("Invalid signature format")))
+                .unwrap());
         };
 
         let mut mac = HmacSha256::new_from_slice(self.config.avatar_proxy_secret.as_bytes())
@@ -1445,7 +1440,7 @@ impl AppService {
                 .unwrap());
         }
 
-        let mxc_url = format!("mxc://{}/{}", server_name, media_id);
+        let mxc_url = format!("mxc://{server_name}/{media_id}");
 
         if let Some(data) = self.cache.m_avatars.get(&mxc_url) {
             let content_type = Self::guess_mime_type(&data);
