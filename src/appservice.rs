@@ -344,18 +344,19 @@ impl AppService {
         }
 
         // Check if room is bridged
-        if let Some(channel_id) = self.db.get_channel(room_id).await? {
-            return self
-                .forward_message_to_discord(
-                    room_id,
-                    sender,
-                    event_id,
-                    content,
-                    &channel_id,
-                    msgtype,
-                )
-                .await;
-        }
+        if let Some(bridge) = self.db.get_bridge(room_id).await?
+            && bridge.m2d_enabled {
+                return self
+                    .forward_message_to_discord(
+                        room_id,
+                        sender,
+                        event_id,
+                        content,
+                        &bridge.channel_id,
+                        msgtype,
+                    )
+                    .await;
+            }
 
         Ok(())
     }
@@ -372,9 +373,13 @@ impl AppService {
         }
 
         // Check if room is bridged
-        let Some(channel_id) = self.db.get_channel(room_id).await? else {
+        let Some(bridge) = self.db.get_bridge(room_id).await? else {
             return Ok(());
         };
+        if !bridge.m2d_enabled {
+            return Ok(());
+        }
+        let channel_id = bridge.channel_id;
 
         let url = content["url"]
             .as_str()
@@ -754,11 +759,16 @@ impl AppService {
         }
 
         // Get channel ID
-        let channel_id = self
+        let bridge = self
             .db
-            .get_channel(room_id)
+            .get_bridge(room_id)
             .await?
             .ok_or_else(|| BridgeError::NotFound)?;
+
+        if !bridge.m2d_enabled {
+            return Ok(());
+        }
+        let channel_id = bridge.channel_id;
 
         // Get webhook
         let webhook = self.get_or_create_webhook(&channel_id).await?;
@@ -829,11 +839,28 @@ impl AppService {
             return Ok(());
         };
 
-        // Get the channel ID
-        let Some(channel_id) = self.db.get_channel(room_id).await? else {
+        // Get the bridge
+        let Some(bridge) = self.db.get_bridge(room_id).await? else {
             tracing::warn!("Room {} not bridged, cannot redact message", room_id);
             return Ok(());
         };
+
+        if !bridge.m2d_enabled {
+            return Ok(());
+        }
+
+        let sender = event["sender"].as_str().unwrap();
+        let is_mod_deletion = match self.matrix.get_event(room_id, redacts).await {
+            Ok(original_event) => original_event.sender != sender,
+            Err(_) => true,
+        };
+
+        if is_mod_deletion && !bridge.m2d_mod_deletions {
+            tracing::debug!("Ignoring M->D mod deletion");
+            return Ok(());
+        }
+
+        let channel_id = bridge.channel_id;
 
         // Get webhook
         let webhook = match self.get_or_create_webhook(&channel_id).await {
@@ -897,11 +924,16 @@ impl AppService {
         };
 
         // Get channel ID
-        let channel_id = self
+        let bridge = self
             .db
-            .get_channel(room_id)
+            .get_bridge(room_id)
             .await?
             .ok_or_else(|| BridgeError::NotFound)?;
+
+        if !bridge.m2d_enabled {
+            return Ok(());
+        }
+        let channel_id = bridge.channel_id;
 
         // Convert Matrix reaction to Discord emoji
         // For custom emojis in :name: format, look them up in cache
@@ -977,9 +1009,14 @@ impl AppService {
             .ok_or_else(|| BridgeError::Matrix("Typing event missing user_ids".to_string()))?;
 
         // Check if room is bridged
-        let Some(channel_id) = self.db.get_channel(room_id).await? else {
+        let Some(bridge) = self.db.get_bridge(room_id).await? else {
             return Ok(());
         };
+
+        if !bridge.m2d_enabled || !bridge.m2d_typing {
+            return Ok(());
+        }
+        let channel_id = bridge.channel_id;
 
         // Process typing indicators
         for user_id in user_ids {

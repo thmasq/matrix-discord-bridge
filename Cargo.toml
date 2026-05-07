@@ -51,6 +51,8 @@ hyper-tls = "0.6.0"
 pulldown-cmark = "0.13.3"
 reqwest = { version = "0.13.3", features = ["json", "multipart", "stream"] }
 moka = { version = "0.12.15", features = ["logging", "sync"] }
+clap = { version = "4.6.1", features = ["derive"] }
+shlex = "1.3.0"
 
 [profile.release]
 opt-level = 3

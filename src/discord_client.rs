@@ -360,6 +360,11 @@ impl DiscordHandler {
         Ok(mxid)
     }
 
+    async fn resolve_bridge(&self, channel_id: &str) -> Option<crate::db::BridgedRoom> {
+        let room_id = self.resolve_room_id(channel_id).await?;
+        self.db.get_bridge(&room_id).await.ok().flatten()
+    }
+
     async fn resolve_room_id(&self, channel_id: &str) -> Option<String> {
         let room_alias = self.matrix.matrixify_room(channel_id);
 
@@ -748,13 +753,17 @@ impl EventHandler for DiscordHandler {
         }
 
         // Resolve Matrix room ID
-        let Some(room_id) = self.resolve_room_id(&channel_id_str).await else {
+        let Some(bridge) = self.resolve_bridge(&channel_id_str).await else {
             tracing::warn!(
                 "Could not resolve Matrix room for Discord channel {}",
                 channel_id_str
             );
             return;
         };
+        if !bridge.d2m_enabled {
+            return;
+        }
+        let room_id = bridge.room_id;
 
         // Ensure user exists and is in room
         let mxid = match self.ensure_user_in_room(&ctx, &message, &room_id).await {
@@ -916,10 +925,14 @@ impl EventHandler for DiscordHandler {
         };
 
         // Resolve room ID
-        let Some(room_id) = self.resolve_room_id(&channel_id_str).await else {
+        let Some(bridge) = self.resolve_bridge(&channel_id_str).await else {
             tracing::warn!("Could not resolve Matrix room for edit");
             return;
         };
+        if !bridge.d2m_enabled {
+            return;
+        }
+        let room_id = bridge.room_id;
 
         let mxid = self
             .matrix
@@ -993,10 +1006,30 @@ impl EventHandler for DiscordHandler {
         };
 
         // Resolve room ID
-        let Some(room_id) = self.resolve_room_id(&channel_id_str).await else {
+        let Some(bridge) = self.resolve_bridge(&channel_id_str).await else {
             tracing::warn!("Could not resolve Matrix room for deletion");
             return;
         };
+
+        if !bridge.d2m_enabled {
+            return;
+        }
+
+        let is_webhook_message = match self
+            .matrix
+            .get_event(&bridge.room_id, &matrix_event_id)
+            .await
+        {
+            Ok(ev) => !ev.sender.starts_with("@_discord_"),
+            Err(_) => true,
+        };
+
+        if is_webhook_message && !bridge.d2m_mod_deletions {
+            tracing::debug!("Ignoring D->M mod deletion");
+            return;
+        }
+
+        let room_id = bridge.room_id;
 
         // Send redaction to Matrix
         match self
@@ -1046,10 +1079,14 @@ impl EventHandler for DiscordHandler {
             return;
         };
 
-        let Some(room_id) = self.resolve_room_id(&channel_id_str).await else {
+        let Some(bridge) = self.resolve_bridge(&channel_id_str).await else {
             tracing::warn!("Could not resolve Matrix room for reaction");
             return;
         };
+        if !bridge.d2m_enabled {
+            return;
+        }
+        let room_id = bridge.room_id;
 
         // Get the user who reacted
         let user = if let Some(uid) = reaction.user_id {
@@ -1122,10 +1159,14 @@ impl EventHandler for DiscordHandler {
             return;
         }
 
-        let Some(room_id) = self.resolve_room_id(&channel_id_str).await else {
+        let Some(bridge) = self.resolve_bridge(&channel_id_str).await else {
             tracing::warn!("Could not resolve Matrix room for reaction removal");
             return;
         };
+        if !bridge.d2m_enabled {
+            return;
+        }
+        let room_id = bridge.room_id;
 
         let user = if let Some(uid) = reaction.user_id {
             match ctx.http.get_user(uid).await {
@@ -1188,9 +1229,13 @@ impl EventHandler for DiscordHandler {
         }
 
         // Resolve room ID
-        let Some(room_id) = self.resolve_room_id(&channel_id_str).await else {
+        let Some(bridge) = self.resolve_bridge(&channel_id_str).await else {
             return;
         };
+        if !bridge.d2m_enabled || !bridge.d2m_typing {
+            return;
+        }
+        let room_id = bridge.room_id;
 
         let mxid = self
             .matrix

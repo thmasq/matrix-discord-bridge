@@ -7,9 +7,16 @@ pub struct Database {
 }
 
 #[derive(Debug, sqlx::FromRow)]
+#[allow(clippy::struct_excessive_bools)]
 pub struct BridgedRoom {
     pub room_id: String,
     pub channel_id: String,
+    pub d2m_enabled: bool,
+    pub m2d_enabled: bool,
+    pub d2m_mod_deletions: bool,
+    pub m2d_mod_deletions: bool,
+    pub d2m_typing: bool,
+    pub m2d_typing: bool,
 }
 
 #[derive(Debug, sqlx::FromRow)]
@@ -40,7 +47,13 @@ impl Database {
         sqlx::query(
             "CREATE TABLE IF NOT EXISTS bridge (
                 room_id TEXT PRIMARY KEY,
-                channel_id TEXT NOT NULL
+                channel_id TEXT NOT NULL,
+                d2m_enabled BOOLEAN NOT NULL DEFAULT 1,
+                m2d_enabled BOOLEAN NOT NULL DEFAULT 1,
+                d2m_mod_deletions BOOLEAN NOT NULL DEFAULT 0,
+                m2d_mod_deletions BOOLEAN NOT NULL DEFAULT 0,
+                d2m_typing BOOLEAN NOT NULL DEFAULT 1,
+                m2d_typing BOOLEAN NOT NULL DEFAULT 1
             )",
         )
         .execute(&pool)
@@ -71,7 +84,7 @@ impl Database {
     }
 
     pub async fn add_room(&self, room_id: &str, channel_id: &str) -> crate::error::Result<()> {
-        sqlx::query("INSERT INTO bridge (room_id, channel_id) VALUES (?, ?)")
+        sqlx::query("INSERT INTO bridge (room_id, channel_id, d2m_enabled, m2d_enabled, d2m_mod_deletions, m2d_mod_deletions, d2m_typing, m2d_typing) VALUES (?, ?, 1, 1, 0, 0, 1, 1)")
             .bind(room_id)
             .bind(channel_id)
             .execute(&self.pool)
@@ -108,7 +121,7 @@ impl Database {
     }
 
     pub async fn list_all_bridges(&self) -> crate::error::Result<Vec<BridgedRoom>> {
-        let bridges = sqlx::query_as::<_, BridgedRoom>("SELECT room_id, channel_id FROM bridge")
+        let bridges = sqlx::query_as::<_, BridgedRoom>("SELECT * FROM bridge")
             .fetch_all(&self.pool)
             .await?;
         Ok(bridges)
@@ -190,6 +203,42 @@ impl Database {
 
     pub async fn remove_invite_by_room(&self, room_id: &str) -> crate::error::Result<()> {
         sqlx::query("DELETE FROM invites WHERE room_id = ?")
+            .bind(room_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn get_bridge(&self, room_id: &str) -> crate::error::Result<Option<BridgedRoom>> {
+        let result = sqlx::query_as::<_, BridgedRoom>("SELECT * FROM bridge WHERE room_id = ?")
+            .bind(room_id)
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(result)
+    }
+
+    pub async fn update_bridge_config(
+        &self,
+        room_id: &str,
+        setting: &str,
+        value: bool,
+    ) -> crate::error::Result<()> {
+        let valid = [
+            "d2m_enabled",
+            "m2d_enabled",
+            "d2m_mod_deletions",
+            "m2d_mod_deletions",
+            "d2m_typing",
+            "m2d_typing",
+        ];
+        if !valid.contains(&setting) {
+            return Err(crate::error::BridgeError::Database(sqlx::Error::Protocol(
+                "Invalid setting".into(),
+            )));
+        }
+        let query = format!("UPDATE bridge SET {setting} = ? WHERE room_id = ?");
+        sqlx::query(&query)
+            .bind(value)
             .bind(room_id)
             .execute(&self.pool)
             .await?;

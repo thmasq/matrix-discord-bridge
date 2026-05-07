@@ -65,6 +65,7 @@ impl AdminCommandHandler {
             "list" => self.cmd_list().await,
             "link" => self.cmd_link(sender, &parts[1..]).await,
             "unlink" => self.cmd_unlink(&parts[1..]).await,
+            "config" => self.cmd_config(&parts[1..]).await,
             "status" => self.cmd_status(&parts[1..]).await,
             "verify" => self.cmd_verify(&parts[1..]).await,
             "invite" => self.cmd_invite(&parts[1..]).await,
@@ -89,6 +90,7 @@ impl AdminCommandHandler {
 > \-  **!link** <_matrix\_room\_id_> <_discord\_channel\_id_> - Create a new bridge
 > Example: `!link !abc123:matrix.org 123456789012345678`
 > 
+> \-  **!config** <_matrix\_room\_id_> [setting] [value] - Configure bridge settings
 > \-  **!unlink** <_matrix\_room\_id_> - Remove a bridge
 > Example: `!unlink !abc123:matrix.org`
 > 
@@ -193,7 +195,7 @@ impl AdminCommandHandler {
                         }
 
                         format!(
-                            "✅ Successfully linked!\n\nMatrix: `{}`\nDiscord: #{} (`{}`)",
+                            "Successfully linked!\n\nMatrix: `{}`\nDiscord: #{} (`{}`)",
                             room_id, channel_info.name, channel_id
                         )
                     }
@@ -201,7 +203,7 @@ impl AdminCommandHandler {
                 }
             }
             Err(e) => {
-                format!("❌ Failed to verify Discord channel `{channel_id}`:\n{e}")
+                format!("Failed to verify Discord channel `{channel_id}`:\n{e}")
             }
         }
     }
@@ -476,5 +478,55 @@ impl AdminCommandHandler {
         let mut result: Vec<usize> = indices.into_iter().collect();
         result.sort_unstable();
         result
+    }
+
+    async fn cmd_config(&self, args: &[&str]) -> String {
+        if args.is_empty() {
+            return "Usage: `!config <matrix_room_id> [setting] [value]`\nSettings: `d2m_enabled`, `m2d_enabled`, `d2m_mod_deletions`, `m2d_mod_deletions`, `d2m_typing`, `m2d_typing`".to_string();
+        }
+
+        let room_id = args[0];
+        let bridge = match self.db.get_bridge(room_id).await {
+            Ok(Some(b)) => b,
+            Ok(None) => return format!("No bridge found for room `{room_id}`"),
+            Err(e) => return format!("Database error: {e}"),
+        };
+
+        if args.len() == 1 {
+            return format!(
+                "**Configuration for {}**\n\
+                            `d2m_enabled`: {}\n\
+                            `m2d_enabled`: {}\n\
+                            `d2m_mod_deletions`: {}\n\
+                            `m2d_mod_deletions`: {}\n\
+                            `d2m_typing`: {}\n\
+                            `m2d_typing`: {}",
+                room_id,
+                bridge.d2m_enabled,
+                bridge.m2d_enabled,
+                bridge.d2m_mod_deletions,
+                bridge.m2d_mod_deletions,
+                bridge.d2m_typing,
+                bridge.m2d_typing
+            );
+        }
+
+        if args.len() < 3 {
+            return "Usage: `!config <matrix_room_id> <setting> <true/false>`".to_string();
+        }
+
+        let setting = args[1];
+        let value_str = args[2].to_lowercase();
+        let value = match value_str.as_str() {
+            "true" | "1" | "yes" | "on" => true,
+            "false" | "0" | "no" | "off" => false,
+            _ => return "Value must be true or false".to_string(),
+        };
+
+        if let Err(e) = self.db.update_bridge_config(room_id, setting, value).await {
+            return format!("Failed to update config: {e}");
+        }
+
+        format!("Updated `{setting}` to `{value}` for bridge `{room_id}`")
     }
 }
