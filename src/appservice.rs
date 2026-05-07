@@ -527,17 +527,6 @@ impl AppService {
         let body = content["body"].as_str().unwrap_or("");
         let formatted_body = content["formatted_body"].as_str();
 
-        // Parse custom emojis from the message
-        let matrix_emojis = MatrixClient::parse_matrix_emojis(body, formatted_body);
-
-        // Get room's custom emojis
-        let room_emojis = self
-            .matrix
-            .get_room_emojis(room_id)
-            .await
-            .unwrap_or_default();
-
-        // Process the message for Discord
         let mut processed_body = body.to_string();
 
         // Handle Matrix mentions -> Discord mentions
@@ -551,46 +540,17 @@ impl AppService {
             }
         }
 
-        // Handle Matrix custom emojis -> Discord emojis
-        // Try to match by name first, otherwise fall back to uploading
-        for (shortcode, mxc_url) in &matrix_emojis {
-            let emoji_pattern = format!(":{shortcode}:");
-
-            // Check if there's a Discord emoji with the same name via DashMap
-            if let Some(discord_format) = self.cache.d_emotes.get(shortcode) {
-                // Found a matching Discord emoji by name - use it directly
-                processed_body = processed_body.replace(&emoji_pattern, &discord_format);
-                tracing::debug!("Matched Matrix emoji :{}: to Discord emoji", shortcode);
-            } else if !mxc_url.is_empty() {
-                // No match found - this would require uploading the image
-                // For now, just leave as :shortcode:
-                // In a full implementation, you could download and upload to Discord
-                tracing::debug!(
-                    "No Discord match for Matrix emoji :{}: ({})",
-                    shortcode,
-                    mxc_url
-                );
-            } else if let Some(room_mxc) = room_emojis.get(shortcode) {
-                // Found in room emojis but no Discord match
-                tracing::debug!(
-                    "Matrix emoji :{}: available in room ({}) but no Discord match",
-                    shortcode,
-                    room_mxc
-                );
-            }
-        }
-
-        // Fallback: Handle any remaining :name: patterns that might be Discord emojis
-        {
-            let emote_regex = EMOTE_REGEX.get_or_init(|| regex::Regex::new(r":(\w+):").unwrap());
-            for cap in emote_regex.captures_iter(body) {
-                if let Some(name) = cap.get(1)
-                    && let Some(discord_emote) = self.cache.d_emotes.get(name.as_str())
-                {
-                    processed_body = processed_body.replace(&cap[0], &discord_emote);
+        let emote_regex = EMOTE_REGEX.get_or_init(|| regex::Regex::new(r":(\w+):").unwrap());
+        processed_body = emote_regex
+            .replace_all(&processed_body, |caps: &regex::Captures| {
+                let name = &caps[1];
+                if let Some(discord_emote) = self.cache.d_emotes.get(name) {
+                    discord_emote.clone()
+                } else {
+                    caps[0].to_string()
                 }
-            }
-        }
+            })
+            .to_string();
 
         // Truncate to Discord's message limit
         if processed_body.len() > DISCORD_MESSAGE_LIMIT {
@@ -766,7 +726,7 @@ impl AppService {
         // Process message similar to forward_to_discord
         let mut processed_body = body.to_string();
 
-        // Handle mentions and emotes
+        // Handle mentions
         let formatted_body = new_content["formatted_body"].as_str();
         let text_to_process = formatted_body.unwrap_or(body);
         let mention_regex = MENTION_REGEX
@@ -778,16 +738,17 @@ impl AppService {
             }
         }
 
-        {
-            let emote_regex = EMOTE_REGEX.get_or_init(|| regex::Regex::new(r":(\w+):").unwrap());
-            for cap in emote_regex.captures_iter(body) {
-                if let Some(name) = cap.get(1)
-                    && let Some(discord_emote) = self.cache.d_emotes.get(name.as_str())
-                {
-                    processed_body = processed_body.replace(&cap[0], &discord_emote);
+        let emote_regex = EMOTE_REGEX.get_or_init(|| regex::Regex::new(r":(\w+):").unwrap());
+        processed_body = emote_regex
+            .replace_all(&processed_body, |caps: &regex::Captures| {
+                let name = &caps[1];
+                if let Some(discord_emote) = self.cache.d_emotes.get(name) {
+                    discord_emote.clone()
+                } else {
+                    caps[0].to_string()
                 }
-            }
-        }
+            })
+            .to_string();
 
         if processed_body.len() > DISCORD_MESSAGE_LIMIT {
             processed_body.truncate(DISCORD_MESSAGE_LIMIT);
