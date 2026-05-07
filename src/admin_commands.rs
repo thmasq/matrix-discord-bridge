@@ -71,10 +71,8 @@ impl AdminCommandHandler {
             _ => return Ok(()), // Unknown command, ignore
         };
 
-        let (plain_body, html_body) = self
-            .matrix
-            .process_for_matrix(&response, &std::collections::HashMap::new())
-            .await;
+        let (plain_body, html_body) =
+            MatrixClient::process_for_matrix(&response, &std::collections::HashMap::new());
 
         let content = RoomMessageEventContent::text_html(plain_body, html_body);
         let _ = self.matrix.send_message(room_id, content, None).await;

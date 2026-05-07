@@ -544,11 +544,10 @@ impl AppService {
         processed_body = emote_regex
             .replace_all(&processed_body, |caps: &regex::Captures| {
                 let name = &caps[1];
-                if let Some(discord_emote) = self.cache.d_emotes.get(name) {
-                    discord_emote.clone()
-                } else {
-                    caps[0].to_string()
-                }
+                self.cache
+                    .d_emotes
+                    .get(name)
+                    .unwrap_or_else(|| caps[0].to_string())
             })
             .to_string();
 
@@ -742,11 +741,10 @@ impl AppService {
         processed_body = emote_regex
             .replace_all(&processed_body, |caps: &regex::Captures| {
                 let name = &caps[1];
-                if let Some(discord_emote) = self.cache.d_emotes.get(name) {
-                    discord_emote.clone()
-                } else {
-                    caps[0].to_string()
-                }
+                self.cache
+                    .d_emotes
+                    .get(name)
+                    .unwrap_or_else(|| caps[0].to_string())
             })
             .to_string();
 

@@ -521,18 +521,16 @@ impl DiscordHandler {
         for cap in plain_emote_regex.captures_iter(content) {
             let emote_name = cap.get(1).unwrap().as_str();
 
-            if !matched_emojis.contains_key(emote_name) {
-                if let Some(mxc_url) = room_emojis.get(emote_name) {
-                    matched_emojis.insert(emote_name.to_string(), mxc_url.clone());
-                }
+            if !matched_emojis.contains_key(emote_name)
+                && let Some(mxc_url) = room_emojis.get(emote_name)
+            {
+                matched_emojis.insert(emote_name.to_string(), mxc_url.clone());
             }
         }
 
         // Process markdown and emotes
-        let (plain_body, formatted_body) = self
-            .matrix
-            .process_for_matrix(content, &matched_emojis)
-            .await;
+        let (plain_body, formatted_body) =
+            MatrixClient::process_for_matrix(content, &matched_emojis);
 
         if let Some(event_id) = reply_to_event_id {
             // Fetch the original event to strip fallbacks
@@ -606,9 +604,9 @@ impl DiscordHandler {
                 }
             }
         } else if formatted_body == plain_body {
-            RoomMessageEventContent::text_plain(plain_body)
+            RoomMessageEventContent::text_plain(&plain_body)
         } else {
-            RoomMessageEventContent::text_html(plain_body, formatted_body)
+            RoomMessageEventContent::text_html(&plain_body, formatted_body)
         }
     }
 }
@@ -936,7 +934,7 @@ impl EventHandler for DiscordHandler {
             content.push_str(&embed_text);
         }
 
-        let (plain_body, formatted_body) = self.matrix.process_for_matrix(&content, &emotes).await;
+        let (plain_body, formatted_body) = MatrixClient::process_for_matrix(&content, &emotes);
 
         let new_content = if formatted_body == plain_body {
             RoomMessageEventContent::text_plain(plain_body)

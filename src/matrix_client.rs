@@ -414,8 +414,7 @@ impl MatrixClient {
     }
 
     #[allow(clippy::too_many_lines)]
-    pub async fn process_for_matrix(
-        &self,
+    pub fn process_for_matrix(
         message: &str,
         mxc_emotes: &HashMap<String, String>,
     ) -> (String, String) {
