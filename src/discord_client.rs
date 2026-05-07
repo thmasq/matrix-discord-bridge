@@ -15,9 +15,18 @@ use serenity::{
         guild::{Guild, Member},
     },
 };
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::HashMap,
+    sync::{Arc, OnceLock},
+};
 use std::{fmt::Write, hash::Hasher};
 use twox_hash::XxHash32;
+
+static ROLE_REGEX: OnceLock<regex::Regex> = OnceLock::new();
+static CHANNEL_REGEX: OnceLock<regex::Regex> = OnceLock::new();
+static EMOTE_REGEX: OnceLock<regex::Regex> = OnceLock::new();
+static REPLY_REGEX: OnceLock<regex::Regex> = OnceLock::new();
+static PLAIN_EMOTE_REGEX: OnceLock<regex::Regex> = OnceLock::new();
 
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
@@ -76,7 +85,7 @@ impl DiscordHandler {
         }
 
         // Process role mentions: <@&123456> -> @role-name
-        let role_regex = regex::Regex::new(r"<@&(\d+)>").unwrap();
+        let role_regex = ROLE_REGEX.get_or_init(|| regex::Regex::new(r"<@&(\d+)>").unwrap());
         for cap in role_regex.captures_iter(&message.content.clone()) {
             if let Some(role_id_match) = cap.get(1) {
                 let role_id = role_id_match.as_str();
@@ -102,7 +111,7 @@ impl DiscordHandler {
         }
 
         // Process channel mentions: <#123456> -> #channel-name
-        let channel_regex = regex::Regex::new(r"<#(\d+)>").unwrap();
+        let channel_regex = CHANNEL_REGEX.get_or_init(|| regex::Regex::new(r"<#(\d+)>").unwrap());
         for cap in channel_regex.captures_iter(&message.content.clone()) {
             if let Some(channel_id_match) = cap.get(1) {
                 let channel_id = channel_id_match.as_str();
@@ -128,7 +137,8 @@ impl DiscordHandler {
         }
 
         // Process emotes: <:name:id> or <a:name:id>
-        let emote_regex = regex::Regex::new(r"<a?:(\w+):(\d+)>").unwrap();
+        let emote_regex =
+            EMOTE_REGEX.get_or_init(|| regex::Regex::new(r"<a?:(\w+):(\d+)>").unwrap());
         for cap in emote_regex.captures_iter(&message.content) {
             let name = cap.get(1).unwrap().as_str();
             let id = cap.get(2).unwrap().as_str();
@@ -442,7 +452,8 @@ impl DiscordHandler {
     /// Strip <mx-reply>...</mx-reply> tags from formatted HTML body
     fn strip_reply_fallback_html(html: &str) -> String {
         // Use regex to strip <mx-reply>...</mx-reply> tags (with DOTALL flag)
-        let regex = regex::Regex::new(r"(?s)<mx-reply>.*?</mx-reply>").unwrap();
+        let regex =
+            REPLY_REGEX.get_or_init(|| regex::Regex::new(r"(?s)<mx-reply>.*?</mx-reply>").unwrap());
         regex.replace_all(html, "").to_string()
     }
 
@@ -501,6 +512,18 @@ impl DiscordHandler {
                             tracing::warn!("Failed to upload Discord emoji {}: {}", emote_name, e);
                         }
                     }
+                }
+            }
+        }
+
+        let plain_emote_regex =
+            PLAIN_EMOTE_REGEX.get_or_init(|| regex::Regex::new(r":([a-zA-Z0-9_-]+):").unwrap());
+        for cap in plain_emote_regex.captures_iter(content) {
+            let emote_name = cap.get(1).unwrap().as_str();
+
+            if !matched_emojis.contains_key(emote_name) {
+                if let Some(mxc_url) = room_emojis.get(emote_name) {
+                    matched_emojis.insert(emote_name.to_string(), mxc_url.clone());
                 }
             }
         }

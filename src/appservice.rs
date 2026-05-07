@@ -15,7 +15,7 @@ use hyper_util::rt::TokioIo;
 use serde_json::{Value, json};
 use sha2::Sha256;
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::{
     net::TcpListener,
@@ -26,6 +26,10 @@ type HmacSha256 = Hmac<Sha256>;
 
 const DISCORD_MESSAGE_LIMIT: usize = 2000;
 const MAX_BODY_SIZE: usize = 20 * 1024 * 1024; // 20 MB
+
+static MENTION_REGEX: OnceLock<regex::Regex> = OnceLock::new();
+static EMOTE_REGEX: OnceLock<regex::Regex> = OnceLock::new();
+static ID_REGEX: OnceLock<regex::Regex> = OnceLock::new();
 
 pub struct AppService {
     config: Config,
@@ -538,7 +542,8 @@ impl AppService {
 
         // Handle Matrix mentions -> Discord mentions
         let text_to_process = formatted_body.unwrap_or(body);
-        let mention_regex = regex::Regex::new(r"@_discord_(\d+)(?:-\d+)?:[\w.\-]+").unwrap();
+        let mention_regex = MENTION_REGEX
+            .get_or_init(|| regex::Regex::new(r"@_discord_(\d+)(?:-\d+)?:[\w.\-]+").unwrap());
         for cap in mention_regex.captures_iter(text_to_process) {
             if let Some(discord_id) = cap.get(1) {
                 let mention = format!("<@{}>", discord_id.as_str());
@@ -577,7 +582,7 @@ impl AppService {
 
         // Fallback: Handle any remaining :name: patterns that might be Discord emojis
         {
-            let emote_regex = regex::Regex::new(r":(\w+):").unwrap();
+            let emote_regex = EMOTE_REGEX.get_or_init(|| regex::Regex::new(r":(\w+):").unwrap());
             for cap in emote_regex.captures_iter(body) {
                 if let Some(name) = cap.get(1)
                     && let Some(discord_emote) = self.cache.d_emotes.get(name.as_str())
@@ -764,7 +769,8 @@ impl AppService {
         // Handle mentions and emotes
         let formatted_body = new_content["formatted_body"].as_str();
         let text_to_process = formatted_body.unwrap_or(body);
-        let mention_regex = regex::Regex::new(r"@_discord_(\d+)(?:-\d+)?:[\w.\-]+").unwrap();
+        let mention_regex = MENTION_REGEX
+            .get_or_init(|| regex::Regex::new(r"@_discord_(\d+)(?:-\d+)?:[\w.\-]+").unwrap());
         for cap in mention_regex.captures_iter(text_to_process) {
             if let Some(discord_id) = cap.get(1) {
                 let mention = format!("<@{}>", discord_id.as_str());
@@ -773,7 +779,7 @@ impl AppService {
         }
 
         {
-            let emote_regex = regex::Regex::new(r":(\w+):").unwrap();
+            let emote_regex = EMOTE_REGEX.get_or_init(|| regex::Regex::new(r":(\w+):").unwrap());
             for cap in emote_regex.captures_iter(body) {
                 if let Some(name) = cap.get(1)
                     && let Some(discord_emote) = self.cache.d_emotes.get(name.as_str())
@@ -947,7 +953,7 @@ impl AppService {
             self.cache.d_emotes.get(name).map_or_else(
                 || urlencoding::encode(reaction_key).to_string(),
                 |discord_format| {
-                    let id_regex = regex::Regex::new(r":(\d+)>$").unwrap();
+                    let id_regex = ID_REGEX.get_or_init(|| regex::Regex::new(r":(\d+)>$").unwrap());
                     id_regex.captures(&discord_format).map_or_else(
                         || urlencoding::encode(reaction_key).to_string(),
                         |cap| format!("{}:{}", name, cap.get(1).unwrap().as_str()),

@@ -21,6 +21,9 @@ use std::{fmt::Write, time::SystemTime};
 type HmacSha256 = Hmac<Sha256>;
 
 static EMOTE_REGEX: OnceLock<regex::Regex> = OnceLock::new();
+static IMG_REGEX: OnceLock<regex::Regex> = OnceLock::new();
+static IMG_REGEX_ALT: OnceLock<regex::Regex> = OnceLock::new();
+static SHORTCODE_REGEX: OnceLock<regex::Regex> = OnceLock::new();
 
 pub struct MatrixClient {
     config: Config,
@@ -414,41 +417,17 @@ impl MatrixClient {
     pub async fn process_for_matrix(
         &self,
         message: &str,
-        emotes: &HashMap<String, String>,
+        mxc_emotes: &HashMap<String, String>,
     ) -> (String, String) {
         let mut resolved_emotes = HashMap::new();
         let emote_regex =
-            EMOTE_REGEX.get_or_init(|| regex::Regex::new(r":([a-zA-Z0-9_]+):").unwrap());
+            EMOTE_REGEX.get_or_init(|| regex::Regex::new(r":([a-zA-Z0-9_-]+):").unwrap());
 
         for cap in emote_regex.captures_iter(message) {
             let emote_name = cap.get(1).unwrap().as_str();
 
-            if let Some(emote_id) = emotes.get(emote_name) {
-                if resolved_emotes.contains_key(emote_name) {
-                    continue;
-                }
-
-                let emote_url = format!("https://cdn.discordapp.com/emojis/{emote_id}.png");
-
-                let mxc_url = self.cache.m_emotes.get(emote_name);
-
-                let mxc_url = if let Some(mxc) = mxc_url {
-                    mxc
-                } else {
-                    match self.upload_from_url(&emote_url).await {
-                        Ok(mxc) => {
-                            self.cache
-                                .m_emotes
-                                .insert(emote_name.to_string(), mxc.clone());
-                            mxc
-                        }
-                        Err(e) => {
-                            tracing::warn!("Failed to upload emote {}: {}", emote_name, e);
-                            continue;
-                        }
-                    }
-                };
-                resolved_emotes.insert(emote_name.to_string(), mxc_url);
+            if let Some(mxc_url) = mxc_emotes.get(emote_name) {
+                resolved_emotes.insert(emote_name.to_string(), mxc_url.clone());
             }
         }
 
@@ -886,9 +865,9 @@ impl MatrixClient {
 
         // Parse HTML formatted body for <img data-mx-emoticon> tags
         if let Some(html) = formatted_body {
-            let img_regex = regex::Regex::new(
-                r#"<img[^>]*data-mx-emoticon[^>]*src="(mxc://[^"]+)"[^>]*(?:alt|title)=":([^:"]+):"[^>]*/?>"#
-            ).unwrap();
+            let img_regex = IMG_REGEX.get_or_init(|| regex::Regex::new(
+                r#"<img[^>]*data-mx-emoticon[^>]*src="(mxc://[^"]+)"[^>]*(?:alt|title)="?:?([^:">]+):?"?[^>]*/?>"#
+            ).unwrap());
 
             for cap in img_regex.captures_iter(html) {
                 if let (Some(mxc_url), Some(shortcode)) = (cap.get(1), cap.get(2)) {
@@ -897,9 +876,9 @@ impl MatrixClient {
             }
 
             // Also try reversed order (title before src)
-            let img_regex_alt = regex::Regex::new(
-                r#"<img[^>]*(?:alt|title)=":([^:"]+):"[^>]*data-mx-emoticon[^>]*src="(mxc://[^"]+)"[^>]*/?>"#
-            ).unwrap();
+            let img_regex_alt = IMG_REGEX_ALT.get_or_init(|| regex::Regex::new(
+                r#"<img[^>]*(?:alt|title)="?:?([^:">]+):?"?[^>]*data-mx-emoticon[^>]*src="(mxc://[^"]+)"[^>]*/?>"#
+            ).unwrap());
 
             for cap in img_regex_alt.captures_iter(html) {
                 if let (Some(shortcode), Some(mxc_url)) = (cap.get(1), cap.get(2)) {
@@ -910,7 +889,9 @@ impl MatrixClient {
 
         // If no HTML, look for :shortcode: patterns in plain text
         if emojis.is_empty() {
-            let shortcode_regex = regex::Regex::new(r":([a-zA-Z0-9_-]+):").unwrap();
+            let shortcode_regex =
+                SHORTCODE_REGEX.get_or_init(|| regex::Regex::new(r":([a-zA-Z0-9_-]+):").unwrap());
+
             for cap in shortcode_regex.captures_iter(body) {
                 if let Some(shortcode) = cap.get(1) {
                     // Mark it as found but without MXC URL
@@ -1102,8 +1083,7 @@ impl MatrixClient {
             return false;
         }
 
-        uri.host().is_some_and(|host| {
-            host == "cdn.discordapp.com" || host == "media.discordapp.net"
-        })
+        uri.host()
+            .is_some_and(|host| host == "cdn.discordapp.com" || host == "media.discordapp.net")
     }
 }
