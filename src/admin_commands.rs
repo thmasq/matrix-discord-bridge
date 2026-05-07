@@ -12,6 +12,14 @@ pub struct AdminCommandHandler {
     discord_http: reqwest::Client,
 }
 
+#[derive(Debug, Clone)]
+struct ChannelInfo {
+    id: String,
+    name: String,
+    guild_id: Option<String>,
+    channel_type: u8,
+}
+
 impl AdminCommandHandler {
     pub const fn new(
         config: Config,
@@ -170,10 +178,7 @@ impl AdminCommandHandler {
                     Ok(()) => {
                         // Update cache
                         let room_alias = self.matrix.matrixify_room(channel_id);
-                        self.cache
-                            .m_rooms
-                            .write()
-                            .insert(room_alias, room_id.to_string());
+                        self.cache.m_rooms.insert(room_alias, room_id.to_string());
 
                         // Prefetch custom emojis
                         match self.matrix.fetch_room_emojis(room_id).await {
@@ -212,22 +217,16 @@ impl AdminCommandHandler {
 
         // Check if bridge exists
         match self.db.get_channel(room_id).await {
-            Ok(Some(channel_id)) => {
-                match self.db.remove_room(room_id).await {
-                    Ok(()) => {
-                        // Clear cache
-                        let room_alias = self.matrix.matrixify_room(&channel_id);
-                        self.cache.m_rooms.write().remove(&room_alias);
-                        self.cache.m_members.write().remove(room_id);
-                        self.cache.m_custom_emojis.write().remove(room_id);
+            Ok(Some(channel_id)) => match self.db.remove_room(room_id).await {
+                Ok(()) => {
+                    self.cache.remove_room_data(room_id);
 
-                        format!(
-                            "✅ Successfully unlinked Matrix room `{room_id}` from Discord channel `{channel_id}`"
-                        )
-                    }
-                    Err(e) => format!("Failed to remove bridge: {e}"),
+                    format!(
+                        "Successfully unlinked Matrix room `{room_id}` from Discord channel `{channel_id}`"
+                    )
                 }
-            }
+                Err(e) => format!("Failed to remove bridge: {e}"),
+            },
             Ok(None) => format!("Matrix room `{room_id}` is not bridged."),
             Err(e) => format!("Database error: {e}"),
         }
@@ -258,7 +257,7 @@ impl AdminCommandHandler {
                             Discord Channel: #{} (`{}`)\n\
                             Guild: {}\n\
                             Custom Emojis Cached: {}\n\
-                            Status: ✅ Active",
+                            Status: Active",
                             room_id,
                             channel_info.name,
                             channel_id,
@@ -271,7 +270,7 @@ impl AdminCommandHandler {
                             "**Bridge Status**\n\n\
                             Matrix Room: `{room_id}`\n\
                             Discord Channel: `{channel_id}`\n\
-                            Status: ⚠️ Discord channel not accessible\n\
+                            Status: Discord channel not accessible\n\
                             Error: {e}"
                         )
                     }
@@ -296,7 +295,7 @@ impl AdminCommandHandler {
         match self.verify_discord_channel(channel_id).await {
             Ok(channel_info) => {
                 format!(
-                    "✅ **Discord Channel Verified**\n\n\
+                    "**Discord Channel Verified**\n\n\
                     Channel: #{} (`{}`)\n\
                     Type: {}\n\
                     Guild: {}",
@@ -313,7 +312,7 @@ impl AdminCommandHandler {
                 )
             }
             Err(e) => {
-                format!("❌ Failed to verify channel `{channel_id}`:\n{e}")
+                format!("Failed to verify channel `{channel_id}`:\n{e}")
             }
         }
     }
@@ -480,12 +479,4 @@ impl AdminCommandHandler {
         result.sort_unstable();
         result
     }
-}
-
-#[derive(Debug, Clone)]
-struct ChannelInfo {
-    id: String,
-    name: String,
-    guild_id: Option<String>,
-    channel_type: u8,
 }

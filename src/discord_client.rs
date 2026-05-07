@@ -84,13 +84,11 @@ impl DiscordHandler {
                 // Try to get role name from cache
                 if let Some(guild_id) = message.guild_id {
                     let guild_id_str = guild_id.to_string();
-                    let role_name = {
-                        let roles = self.cache.d_roles.read();
-                        roles
-                            .get(&guild_id_str)
-                            .and_then(|guild_roles| guild_roles.get(role_id))
-                            .cloned()
-                    };
+                    let role_name = self
+                        .cache
+                        .d_roles
+                        .get(&guild_id_str)
+                        .and_then(|guild_roles| guild_roles.get(role_id).cloned());
 
                     if let Some(name) = role_name {
                         content = content.replace(&cap[0], &format!("@{name}"));
@@ -112,13 +110,11 @@ impl DiscordHandler {
                 // Try to get channel name from cache
                 if let Some(guild_id) = message.guild_id {
                     let guild_id_str = guild_id.to_string();
-                    let channel_name = {
-                        let channels = self.cache.d_channels.read();
-                        channels
-                            .get(&guild_id_str)
-                            .and_then(|guild_channels| guild_channels.get(channel_id))
-                            .cloned()
-                    };
+                    let channel_name = self
+                        .cache
+                        .d_channels
+                        .get(&guild_id_str)
+                        .and_then(|guild_channels| guild_channels.get(channel_id).cloned());
 
                     if let Some(name) = channel_name {
                         content = content.replace(&cap[0], &format!("#{name}"));
@@ -358,19 +354,13 @@ impl DiscordHandler {
         let room_alias = self.matrix.matrixify_room(channel_id);
 
         // Check cache first
-        {
-            let rooms = self.cache.m_rooms.read();
-            if let Some(room_id) = rooms.get(&room_alias) {
-                return Some(room_id.clone());
-            }
+        if let Some(room_id) = self.cache.m_rooms.get(&room_alias) {
+            return Some(room_id);
         }
 
         match self.db.get_room_by_channel(channel_id).await {
             Ok(Some(room_id)) => {
-                self.cache
-                    .m_rooms
-                    .write()
-                    .insert(room_alias, room_id.clone());
+                self.cache.m_rooms.insert(room_alias, room_id.clone());
                 Some(room_id)
             }
             Ok(None) => {
@@ -393,8 +383,7 @@ impl DiscordHandler {
 
     fn is_bridge_webhook(&self, message: &Message) -> bool {
         if let Some(webhook_id) = message.webhook_id {
-            let webhooks = self.cache.d_webhooks.read();
-            for info in webhooks.values() {
+            for (_key, info) in self.cache.d_webhooks.iter() {
                 if info.id == webhook_id.to_string() {
                     return true;
                 }
@@ -490,10 +479,7 @@ impl DiscordHandler {
                 let discord_url = format!("https://cdn.discordapp.com/emojis/{discord_id}.png");
 
                 // Check if we've already uploaded this emoji
-                let cached_mxc = {
-                    let cache = self.cache.m_emotes.read();
-                    cache.get(emote_name).cloned()
-                };
+                let cached_mxc = self.cache.m_emotes.get(emote_name);
 
                 if let Some(mxc) = cached_mxc {
                     matched_emojis.insert(emote_name.clone(), mxc);
@@ -503,7 +489,6 @@ impl DiscordHandler {
                         Ok(mxc_url) => {
                             self.cache
                                 .m_emotes
-                                .write()
                                 .insert(emote_name.clone(), mxc_url.clone());
                             matched_emojis.insert(emote_name.clone(), mxc_url);
                             tracing::debug!(
@@ -619,53 +604,34 @@ impl EventHandler for DiscordHandler {
 
         // Cache emotes
         let emote_count = guild.emojis.len();
-
-        {
-            let mut emotes = self.cache.d_emotes.write();
-
-            for (emoji_id, emoji) in &guild.emojis {
-                let emote_str = if emoji.animated {
-                    format!("<a:{}:{}>", emoji.name, emoji_id)
-                } else {
-                    format!("<:{}:{}>", emoji.name, emoji_id)
-                };
-
-                emotes.insert(emoji.name.clone(), emote_str);
-            }
-        } // write lock dropped here
-
+        for (emoji_id, emoji) in &guild.emojis {
+            let emote_str = if emoji.animated {
+                format!("<a:{}:{}>", emoji.name, emoji_id)
+            } else {
+                format!("<:{}:{}>", emoji.name, emoji_id)
+            };
+            self.cache.d_emotes.insert(emoji.name.clone(), emote_str);
+        }
         tracing::debug!("Cached {} emotes from guild {}", emote_count, guild.id);
 
         // Cache roles
         let role_count = guild.roles.len();
-
-        {
-            let mut roles_cache = self.cache.d_roles.write();
-            let mut guild_roles = HashMap::new();
-
-            for (role_id, role) in &guild.roles {
-                guild_roles.insert(role_id.to_string(), role.name.clone());
-            }
-
-            roles_cache.insert(guild_id_str.clone(), guild_roles);
-        } // write lock dropped here
-
+        let mut guild_roles = HashMap::new();
+        for (role_id, role) in &guild.roles {
+            guild_roles.insert(role_id.to_string(), role.name.clone());
+        }
+        self.cache.d_roles.insert(guild_id_str.clone(), guild_roles);
         tracing::debug!("Cached {} roles from guild {}", role_count, guild.id);
 
         // Cache channels
         let channel_count = guild.channels.len();
-
-        {
-            let mut channels_cache = self.cache.d_channels.write();
-            let mut guild_channels = HashMap::new();
-
-            for (channel_id, channel) in &guild.channels {
-                guild_channels.insert(channel_id.to_string(), channel.name.clone());
-            }
-
-            channels_cache.insert(guild_id_str.clone(), guild_channels);
-        } // write lock dropped here
-
+        let mut guild_channels = HashMap::new();
+        for (channel_id, channel) in &guild.channels {
+            guild_channels.insert(channel_id.to_string(), channel.name.clone());
+        }
+        self.cache
+            .d_channels
+            .insert(guild_id_str.clone(), guild_channels);
         tracing::debug!("Cached {} channels from guild {}", channel_count, guild.id);
 
         // Sync profiles for all members (async in background)
@@ -690,6 +656,15 @@ impl EventHandler for DiscordHandler {
         }
 
         tracing::info!("Completed profile sync for guild {}", guild.id);
+    }
+
+    async fn guild_delete(
+        &self,
+        _ctx: Context,
+        incomplete: serenity::model::guild::UnavailableGuild,
+        _full: Option<Guild>,
+    ) {
+        self.cache.remove_guild_data(&incomplete.id.to_string());
     }
 
     async fn guild_member_update(
@@ -781,8 +756,7 @@ impl EventHandler for DiscordHandler {
         // Check if this is a reply
         let reply_to_event_id = message.referenced_message.as_ref().and_then(|referenced| {
             // Look up the Matrix event ID for the referenced Discord message
-            let d_messages = self.cache.d_messages.read();
-            d_messages.get(&referenced.id.to_string()).cloned()
+            self.cache.d_messages.get(&referenced.id.to_string())
         });
 
         // Send text message if there's content
@@ -811,13 +785,7 @@ impl EventHandler for DiscordHandler {
                     message_event_id = Some(event_id.clone());
 
                     self.cache
-                        .d_messages
-                        .write()
-                        .insert(message.id.to_string(), event_id.clone());
-                    self.cache
-                        .m_messages
-                        .write()
-                        .insert(event_id, message.id.to_string());
+                        .insert_message_mapping(event_id, message.id.to_string());
                 }
                 Err(e) => {
                     tracing::error!("Failed to send message to Matrix room {}: {}", room_id, e);
@@ -836,13 +804,7 @@ impl EventHandler for DiscordHandler {
                     // Cache first attachment event ID if we don't have a text message
                     if message_event_id.is_none() && !event_ids.is_empty() {
                         self.cache
-                            .d_messages
-                            .write()
-                            .insert(message.id.to_string(), event_ids[0].clone());
-                        self.cache
-                            .m_messages
-                            .write()
-                            .insert(event_ids[0].clone(), message.id.to_string());
+                            .insert_message_mapping(event_ids[0].clone(), message.id.to_string());
                     }
                 }
                 Err(e) => {
@@ -874,14 +836,7 @@ impl EventHandler for DiscordHandler {
                     // Now borrow from message_event_id instead of owning again
                     if let Some(ref eid) = message_event_id {
                         self.cache
-                            .d_messages
-                            .write()
-                            .insert(message.id.to_string(), eid.clone());
-
-                        self.cache
-                            .m_messages
-                            .write()
-                            .insert(eid.clone(), message.id.to_string());
+                            .insert_message_mapping(eid.clone(), message.id.to_string());
                     }
                 }
                 Err(e) => {
@@ -929,11 +884,7 @@ impl EventHandler for DiscordHandler {
             return;
         }
 
-        // Find the original Matrix event ID
-        let matrix_event_id = {
-            let d_messages = self.cache.d_messages.read();
-            d_messages.get(&new_msg.id.to_string()).cloned()
-        };
+        let matrix_event_id = self.cache.d_messages.get(&new_msg.id.to_string());
 
         let Some(matrix_event_id) = matrix_event_id else {
             tracing::debug!(
@@ -1010,11 +961,7 @@ impl EventHandler for DiscordHandler {
             return;
         }
 
-        // Find the Matrix event ID for this Discord message
-        let matrix_event_id = {
-            let d_messages = self.cache.d_messages.read();
-            d_messages.get(&deleted_message_id.to_string()).cloned()
-        };
+        let matrix_event_id = self.cache.d_messages.get(&deleted_message_id.to_string());
 
         let Some(matrix_event_id) = matrix_event_id else {
             tracing::debug!(
@@ -1042,12 +989,10 @@ impl EventHandler for DiscordHandler {
                     deleted_message_id
                 );
 
-                // Clean up cache
-                self.cache
-                    .d_messages
-                    .write()
-                    .remove(&deleted_message_id.to_string());
-                self.cache.m_messages.write().remove(&matrix_event_id);
+                self.cache.remove_message_mapping(
+                    Some(&matrix_event_id),
+                    Some(&deleted_message_id.to_string()),
+                );
             }
             Err(e) => {
                 tracing::error!("Failed to redact Matrix event {}: {}", matrix_event_id, e);
@@ -1070,11 +1015,7 @@ impl EventHandler for DiscordHandler {
             return;
         }
 
-        // Find the Matrix event ID for this Discord message
-        let matrix_event_id = {
-            let d_messages = self.cache.d_messages.read();
-            d_messages.get(&reaction.message_id.to_string()).cloned()
-        };
+        let matrix_event_id = self.cache.d_messages.get(&reaction.message_id.to_string());
 
         let Some(matrix_event_id) = matrix_event_id else {
             tracing::debug!(
@@ -1137,10 +1078,7 @@ impl EventHandler for DiscordHandler {
 
                 // Cache the reaction mapping
                 let cache_key = format!("{}:{}:{}", reaction.message_id, user.id, reaction_key);
-                self.cache
-                    .d_messages
-                    .write()
-                    .insert(cache_key, reaction_event_id);
+                self.cache.d_messages.insert(cache_key, reaction_event_id);
             }
             Err(e) => {
                 tracing::error!("Failed to send reaction to Matrix: {}", e);
@@ -1195,16 +1133,13 @@ impl EventHandler for DiscordHandler {
 
         // Find the reaction event ID from cache
         let cache_key = format!("{}:{}:{}", reaction.message_id, user.id, reaction_key);
-        let reaction_event_id = {
-            let messages = self.cache.d_messages.read();
-            messages.get(&cache_key).cloned()
-        };
+        let reaction_event_id = self.cache.d_messages.get(&cache_key);
 
         if let Some(event_id) = reaction_event_id {
             match self.matrix.redact_event(&room_id, &event_id, None).await {
                 Ok(()) => {
                     tracing::info!("Redacted Matrix reaction {}", event_id);
-                    self.cache.d_messages.write().remove(&cache_key);
+                    self.cache.d_messages.invalidate(&cache_key);
                 }
                 Err(e) => {
                     tracing::error!("Failed to redact reaction: {}", e);

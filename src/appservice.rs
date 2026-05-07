@@ -2,6 +2,8 @@ use crate::{
     admin_commands::AdminCommandHandler, cache::Cache, config::Config, db::Database,
     error::BridgeError, matrix_client::MatrixClient,
 };
+use hmac::KeyInit;
+use hmac::{Hmac, Mac};
 use http_body_util::{BodyExt, Full};
 use hyper::{
     Method, Request, Response, StatusCode,
@@ -11,14 +13,19 @@ use hyper::{
 };
 use hyper_util::rt::TokioIo;
 use serde_json::{Value, json};
+use sha2::Sha256;
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::{
     net::TcpListener,
     sync::{Mutex, mpsc},
 };
 
+type HmacSha256 = Hmac<Sha256>;
+
 const DISCORD_MESSAGE_LIMIT: usize = 2000;
+const MAX_BODY_SIZE: usize = 20 * 1024 * 1024; // 20 MB
 
 pub struct AppService {
     config: Config,
@@ -29,6 +36,12 @@ pub struct AppService {
     admin_handler: AdminCommandHandler,
     event_sender: mpsc::Sender<Value>,
     event_receiver: Mutex<Option<mpsc::Receiver<Value>>>,
+}
+
+#[derive(Debug, Clone)]
+struct WebhookData {
+    id: String,
+    token: String,
 }
 
 impl AppService {
@@ -131,6 +144,8 @@ impl AppService {
 
         if method == Method::PUT && path.starts_with("/_matrix/app/v1/transactions/") {
             self.handle_transaction(req).await
+        } else if method == Method::GET && path.starts_with("/avatar/") {
+            self.handle_avatar_request(req).await
         } else {
             Ok(Response::builder()
                 .status(StatusCode::NOT_FOUND)
@@ -156,9 +171,15 @@ impl AppService {
             .and_then(|h| h.to_str().ok())
             .and_then(|s| s.strip_prefix("Bearer "));
 
-        if token_query != Some(&self.config.hs_token)
-            && token_header != Some(self.config.hs_token.as_str())
-        {
+        let query_valid = token_query.map_or(false, |t| {
+            constant_time_eq::constant_time_eq(t.as_bytes(), self.config.hs_token.as_bytes())
+        });
+
+        let header_valid = token_header.map_or(false, |t| {
+            constant_time_eq::constant_time_eq(t.as_bytes(), self.config.hs_token.as_bytes())
+        });
+
+        if !query_valid && !header_valid {
             return Ok(Response::builder()
                 .status(StatusCode::FORBIDDEN)
                 .body(Full::new(Bytes::from(
@@ -171,9 +192,30 @@ impl AppService {
         }
 
         // Parse body
-        let body = req.collect().await?.to_bytes();
+        let limited_body = http_body_util::Limited::new(req.into_body(), MAX_BODY_SIZE);
+
+        let body = limited_body
+            .collect()
+            .await
+            .map_err(|e| {
+                crate::error::BridgeError::Matrix(format!("Body too large or read error: {e}"))
+            })?
+            .to_bytes();
+
         let json: Value = serde_json::from_slice(&body)?;
-        let events = json["events"].as_array().unwrap();
+
+        let Some(events) = json.get("events").and_then(|e| e.as_array()) else {
+            return Ok(Response::builder()
+                .status(StatusCode::BAD_REQUEST)
+                .body(Full::new(Bytes::from(
+                    serde_json::to_vec(&serde_json::json!({
+                        "errcode": "M_BAD_JSON",
+                        "error": "Missing or invalid 'events' array"
+                    }))
+                    .unwrap(),
+                )))
+                .unwrap());
+        };
 
         // Process events
         for event in events {
@@ -216,7 +258,7 @@ impl AppService {
         let membership = content["membership"].as_str().unwrap_or("");
 
         // Clear member cache for this room
-        self.cache.m_members.write().remove(room_id);
+        self.cache.m_members.remove(room_id);
 
         // If it's an event targeting our bot user
         if state_key == self.config.full_user_id() {
@@ -336,8 +378,34 @@ impl AppService {
 
         let body = content["body"].as_str().unwrap_or("sticker");
 
-        // Download from Matrix
-        let sticker_data = self.matrix.download_media(url).await?;
+        // Determine download URL
+        let parts: Vec<&str> = url.trim_start_matches("mxc://").split('/').collect();
+        if parts.len() != 2 {
+            return Err(BridgeError::Matrix("Invalid MXC URL format".to_string()));
+        }
+
+        let download_url = format!(
+            "{}/_matrix/client/v1/media/download/{}/{}",
+            self.config.homeserver, parts[0], parts[1]
+        );
+
+        // Fetch as a stream
+        let res = self
+            .discord_http
+            .get(&download_url)
+            .header("Authorization", format!("Bearer {}", self.config.as_token))
+            .send()
+            .await
+            .map_err(|e| BridgeError::Matrix(format!("Failed to fetch sticker for stream: {e}")))?;
+
+        if !res.status().is_success() {
+            return Err(BridgeError::Matrix(format!(
+                "Failed to download sticker: {}",
+                res.status()
+            )));
+        }
+
+        let file_body = reqwest::Body::wrap_stream(res.bytes_stream());
 
         // Get member info for display name and avatar
         let members = self.get_room_members(room_id).await?;
@@ -375,27 +443,21 @@ impl AppService {
                     }
                 });
 
-        // Send sticker as an image file to Discord
+        // Send sticker stream as an image file to Discord
         let discord_msg_id = self
-            .send_webhook_with_file(
+            .send_webhook_with_stream(
                 &webhook,
                 body,
                 display_name,
                 avatar_url.as_deref(),
                 filename,
-                &sticker_data,
+                file_body,
             )
             .await?;
 
         // Cache the mapping
         self.cache
-            .m_messages
-            .write()
-            .insert(event_id.to_string(), discord_msg_id.clone());
-        self.cache
-            .d_messages
-            .write()
-            .insert(discord_msg_id, event_id.to_string());
+            .insert_message_mapping(event_id.to_string(), discord_msg_id);
 
         tracing::info!("Successfully sent Matrix sticker {} to Discord", event_id);
 
@@ -408,7 +470,7 @@ impl AppService {
         tracing::info!("Emoji pack updated in room {}, refreshing cache", room_id);
 
         // Clear the cache for this room
-        self.cache.m_custom_emojis.write().remove(room_id);
+        self.cache.m_custom_emojis.remove(room_id);
 
         // Fetch fresh emoji data
         match self.matrix.fetch_room_emojis(room_id).await {
@@ -464,13 +526,12 @@ impl AppService {
         // Parse custom emojis from the message
         let matrix_emojis = MatrixClient::parse_matrix_emojis(body, formatted_body);
 
-        // Get room's custom emojis and Discord emojis for matching
+        // Get room's custom emojis
         let room_emojis = self
             .matrix
             .get_room_emojis(room_id)
             .await
             .unwrap_or_default();
-        let discord_emojis = self.cache.d_emotes.read().clone();
 
         // Process the message for Discord
         let mut processed_body = body.to_string();
@@ -490,10 +551,10 @@ impl AppService {
         for (shortcode, mxc_url) in &matrix_emojis {
             let emoji_pattern = format!(":{shortcode}:");
 
-            // Check if there's a Discord emoji with the same name
-            if let Some(discord_format) = discord_emojis.get(shortcode) {
+            // Check if there's a Discord emoji with the same name via DashMap
+            if let Some(discord_format) = self.cache.d_emotes.get(shortcode) {
                 // Found a matching Discord emoji by name - use it directly
-                processed_body = processed_body.replace(&emoji_pattern, discord_format);
+                processed_body = processed_body.replace(&emoji_pattern, &discord_format);
                 tracing::debug!("Matched Matrix emoji :{}: to Discord emoji", shortcode);
             } else if !mxc_url.is_empty() {
                 // No match found - this would require uploading the image
@@ -516,13 +577,12 @@ impl AppService {
 
         // Fallback: Handle any remaining :name: patterns that might be Discord emojis
         {
-            let emotes = self.cache.d_emotes.read();
             let emote_regex = regex::Regex::new(r":(\w+):").unwrap();
             for cap in emote_regex.captures_iter(body) {
-                if let Some(name) = cap.get(1)
-                    && let Some(discord_emote) = emotes.get(name.as_str())
-                {
-                    processed_body = processed_body.replace(&cap[0], discord_emote);
+                if let Some(name) = cap.get(1) {
+                    if let Some(discord_emote) = self.cache.d_emotes.get(name.as_str()) {
+                        processed_body = processed_body.replace(&cap[0], &discord_emote);
+                    }
                 }
             }
         }
@@ -568,13 +628,7 @@ impl AppService {
 
         // Cache the mapping
         self.cache
-            .m_messages
-            .write()
-            .insert(event_id.to_string(), discord_msg_id.clone());
-        self.cache
-            .d_messages
-            .write()
-            .insert(discord_msg_id, event_id.to_string());
+            .insert_message_mapping(event_id.to_string(), discord_msg_id);
 
         Ok(())
     }
@@ -609,8 +663,34 @@ impl AppService {
 
         let message_content = "";
 
-        // Download from Matrix
-        let media_data = self.matrix.download_media(url).await?;
+        // Determine download URL
+        let parts: Vec<&str> = url.trim_start_matches("mxc://").split('/').collect();
+        if parts.len() != 2 {
+            return Err(BridgeError::Matrix("Invalid MXC URL format".to_string()));
+        }
+
+        let download_url = format!(
+            "{}/_matrix/client/v1/media/download/{}/{}",
+            self.config.homeserver, parts[0], parts[1]
+        );
+
+        // Fetch as a stream
+        let res = self
+            .discord_http
+            .get(&download_url)
+            .header("Authorization", format!("Bearer {}", self.config.as_token))
+            .send()
+            .await
+            .map_err(|e| BridgeError::Matrix(format!("Failed to fetch media for stream: {e}")))?;
+
+        if !res.status().is_success() {
+            return Err(BridgeError::Matrix(format!(
+                "Failed to download media: {}",
+                res.status()
+            )));
+        }
+
+        let file_body = reqwest::Body::wrap_stream(res.bytes_stream());
 
         // Get member info
         let members = self.get_room_members(room_id).await?;
@@ -636,27 +716,21 @@ impl AppService {
         // Get webhook
         let webhook = self.get_or_create_webhook(channel_id).await?;
 
-        // Upload to Discord and send
+        // Upload to Discord and send stream
         let discord_msg_id = self
-            .send_webhook_with_file(
+            .send_webhook_with_stream(
                 &webhook,
                 message_content,
                 display_name,
                 avatar_url.as_deref(),
                 &filename,
-                &media_data,
+                file_body,
             )
             .await?;
 
         // Cache the mapping
         self.cache
-            .m_messages
-            .write()
-            .insert(event_id.to_string(), discord_msg_id.clone());
-        self.cache
-            .d_messages
-            .write()
-            .insert(discord_msg_id, event_id.to_string());
+            .insert_message_mapping(event_id.to_string(), discord_msg_id);
 
         Ok(())
     }
@@ -670,10 +744,7 @@ impl AppService {
         content: &Value,
     ) -> crate::error::Result<()> {
         // Get the Discord message ID from the original event
-        let discord_msg_id = {
-            let messages = self.cache.m_messages.read();
-            messages.get(original_event_id).cloned()
-        };
+        let discord_msg_id = self.cache.m_messages.get(original_event_id);
 
         let Some(discord_msg_id) = discord_msg_id else {
             tracing::debug!("No Discord message found for edit of {}", original_event_id);
@@ -702,13 +773,12 @@ impl AppService {
         }
 
         {
-            let emotes = self.cache.d_emotes.read();
             let emote_regex = regex::Regex::new(r":(\w+):").unwrap();
             for cap in emote_regex.captures_iter(body) {
-                if let Some(name) = cap.get(1)
-                    && let Some(discord_emote) = emotes.get(name.as_str())
-                {
-                    processed_body = processed_body.replace(&cap[0], discord_emote);
+                if let Some(name) = cap.get(1) {
+                    if let Some(discord_emote) = self.cache.d_emotes.get(name.as_str()) {
+                        processed_body = processed_body.replace(&cap[0], &discord_emote);
+                    }
                 }
             }
         }
@@ -746,11 +816,8 @@ impl AppService {
         room_id: &str,
     ) -> crate::error::Result<HashMap<String, crate::cache::MatrixUser>> {
         // Check cache first
-        {
-            let members = self.cache.m_members.read();
-            if let Some(cached) = members.get(room_id) {
-                return Ok(cached.clone());
-            }
+        if let Some(cached) = self.cache.m_members.get(room_id) {
+            return Ok(cached.clone());
         }
 
         // Fetch from homeserver
@@ -778,10 +845,9 @@ impl AppService {
         }
 
         // Cache the result
-        {
-            let mut cache = self.cache.m_members.write();
-            cache.insert(room_id.to_string(), members.clone());
-        }
+        self.cache
+            .m_members
+            .insert(room_id.to_string(), members.clone());
 
         Ok(members)
     }
@@ -791,10 +857,7 @@ impl AppService {
         let redacts = event["redacts"].as_str().unwrap();
 
         // Look up the Discord message ID from cache
-        let discord_msg_id = {
-            let messages = self.cache.m_messages.read();
-            messages.get(redacts).cloned()
-        };
+        let discord_msg_id = self.cache.m_messages.get(redacts);
 
         let Some(discord_msg_id) = discord_msg_id else {
             tracing::debug!("No Discord message found for redaction of {}", redacts);
@@ -825,8 +888,8 @@ impl AppService {
                 );
 
                 // Clean up cache
-                self.cache.m_messages.write().remove(redacts);
-                self.cache.d_messages.write().remove(&discord_msg_id);
+                self.cache
+                    .remove_message_mapping(Some(redacts), Some(&discord_msg_id));
             }
             Err(e) => {
                 tracing::error!("Failed to delete Discord message {}: {}", discord_msg_id, e);
@@ -861,10 +924,7 @@ impl AppService {
             .ok_or_else(|| BridgeError::Matrix("Reaction missing key".to_string()))?;
 
         // Find the Discord message ID
-        let discord_msg_id = {
-            let messages = self.cache.m_messages.read();
-            messages.get(target_event_id).cloned()
-        };
+        let discord_msg_id = self.cache.m_messages.get(target_event_id);
 
         let Some(discord_msg_id) = discord_msg_id else {
             tracing::debug!("No Discord message found for reaction");
@@ -882,20 +942,17 @@ impl AppService {
         // For custom emojis in :name: format, look them up in cache
         let discord_emoji = if reaction_key.starts_with(':') && reaction_key.ends_with(':') {
             let name = reaction_key.trim_matches(':');
-            let emotes = self.cache.d_emotes.read();
 
             // Extract just the emoji ID from the Discord format
-            emotes.get(name).map_or_else(
-                || urlencoding::encode(reaction_key).to_string(),
-                |discord_format| {
-                    // Discord format is <:name:id> or <a:name:id>
-                    let id_regex = regex::Regex::new(r":(\d+)>$").unwrap();
-                    id_regex.captures(discord_format).map_or_else(
-                        || urlencoding::encode(reaction_key).to_string(),
-                        |cap| format!("{}:{}", name, cap.get(1).unwrap().as_str()),
-                    )
-                },
-            )
+            if let Some(discord_format) = self.cache.d_emotes.get(name) {
+                let id_regex = regex::Regex::new(r":(\d+)>$").unwrap();
+                id_regex.captures(&discord_format).map_or_else(
+                    || urlencoding::encode(reaction_key).to_string(),
+                    |cap| format!("{}:{}", name, cap.get(1).unwrap().as_str()),
+                )
+            } else {
+                urlencoding::encode(reaction_key).to_string()
+            }
         } else {
             // Unicode emoji
             urlencoding::encode(reaction_key).to_string()
@@ -940,7 +997,6 @@ impl AppService {
         let cache_key = format!("{discord_msg_id}:{sender}:{reaction_key}");
         self.cache
             .m_messages
-            .write()
             .insert(cache_key, event_id.to_string());
 
         Ok(())
@@ -1000,14 +1056,11 @@ impl AppService {
 
     async fn get_or_create_webhook(&self, channel_id: &str) -> crate::error::Result<WebhookData> {
         // Check cache first
-        {
-            let webhooks = self.cache.d_webhooks.read();
-            if let Some(info) = webhooks.get(channel_id) {
-                return Ok(WebhookData {
-                    id: info.id.clone(),
-                    token: info.token.clone(),
-                });
-            }
+        if let Some(info) = self.cache.d_webhooks.get(channel_id) {
+            return Ok(WebhookData {
+                id: info.id.clone(),
+                token: info.token.clone(),
+            });
         }
 
         // Fetch existing webhooks
@@ -1087,16 +1140,13 @@ impl AppService {
         };
 
         // Cache it
-        {
-            let mut webhooks = self.cache.d_webhooks.write();
-            webhooks.insert(
-                channel_id.to_string(),
-                crate::cache::WebhookInfo {
-                    id: webhook_data.id.clone(),
-                    token: webhook_data.token.clone(),
-                },
-            );
-        }
+        self.cache.d_webhooks.insert(
+            channel_id.to_string(),
+            crate::cache::WebhookInfo {
+                id: webhook_data.id.clone(),
+                token: webhook_data.token.clone(),
+            },
+        );
 
         Ok(webhook_data)
     }
@@ -1156,27 +1206,26 @@ impl AppService {
         Ok(message["id"].as_str().unwrap().to_string())
     }
 
-    async fn send_webhook_with_file(
+    async fn send_webhook_with_stream(
         &self,
         webhook: &WebhookData,
         content: &str,
         username: &str,
         avatar_url: Option<&str>,
         filename: &str,
-        file_data: &[u8],
+        file_body: reqwest::Body,
     ) -> crate::error::Result<String> {
         let url = format!(
             "https://discord.com/api/v10/webhooks/{}/{}?wait=true",
             webhook.id, webhook.token
         );
 
-        // Build multipart form
         let form = reqwest::multipart::Form::new()
             .text("username", username.to_string())
             .text("content", content.to_string())
             .part(
                 "file",
-                reqwest::multipart::Part::bytes(file_data.to_vec()).file_name(filename.to_string()),
+                reqwest::multipart::Part::stream(file_body).file_name(filename.to_string()),
             );
 
         let mut request = self.discord_http.post(&url).multipart(form);
@@ -1281,10 +1330,167 @@ impl AppService {
 
         Ok(())
     }
-}
 
-#[derive(Debug, Clone)]
-struct WebhookData {
-    id: String,
-    token: String,
+    async fn handle_avatar_request(
+        &self,
+        req: Request<Incoming>,
+    ) -> crate::error::Result<Response<Full<Bytes>>> {
+        let path = req.uri().path();
+        let parts: Vec<&str> = path.split('/').collect();
+        if parts.len() < 4 {
+            return Ok(Response::builder()
+                .status(StatusCode::BAD_REQUEST)
+                .body(Full::new(Bytes::from("Invalid path")))
+                .unwrap());
+        }
+
+        let server_name = parts[2];
+        let media_id = parts[3];
+
+        let is_safe = |s: &str| {
+            !s.contains("..")
+                && s.chars().all(|c| {
+                    c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.' || c == ':'
+                })
+        };
+
+        if !is_safe(server_name) || !is_safe(media_id) {
+            return Ok(Response::builder()
+                .status(StatusCode::BAD_REQUEST)
+                .body(Full::new(Bytes::from("Invalid characters in request")))
+                .unwrap());
+        }
+
+        let query = req.uri().query().unwrap_or("");
+
+        let exp_param = query
+            .split('&')
+            .find(|s| s.starts_with("exp="))
+            .and_then(|s| s.strip_prefix("exp="));
+
+        let Some(exp_str) = exp_param else {
+            return Ok(Response::builder()
+                .status(StatusCode::UNAUTHORIZED)
+                .body(Full::new(Bytes::from("Missing expiry parameter")))
+                .unwrap());
+        };
+
+        let exp_ts = match exp_str.parse::<u64>() {
+            Ok(ts) => ts,
+            Err(_) => {
+                return Ok(Response::builder()
+                    .status(StatusCode::BAD_REQUEST)
+                    .body(Full::new(Bytes::from("Invalid expiry format")))
+                    .unwrap());
+            }
+        };
+
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        if now > exp_ts {
+            tracing::debug!(
+                "Rejected expired avatar link for {}/{}",
+                server_name,
+                media_id
+            );
+            return Ok(Response::builder()
+                .status(StatusCode::FORBIDDEN)
+                .body(Full::new(Bytes::from("Link has expired")))
+                .unwrap());
+        }
+
+        let sig_param = query
+            .split('&')
+            .find(|s| s.starts_with("sig="))
+            .and_then(|s| s.strip_prefix("sig="));
+
+        let Some(provided_sig_hex) = sig_param else {
+            return Ok(Response::builder()
+                .status(StatusCode::UNAUTHORIZED)
+                .body(Full::new(Bytes::from("Missing signature")))
+                .unwrap());
+        };
+
+        let provided_sig_bytes = match hex::decode(provided_sig_hex) {
+            Ok(b) => b,
+            Err(_) => {
+                return Ok(Response::builder()
+                    .status(StatusCode::BAD_REQUEST)
+                    .body(Full::new(Bytes::from("Invalid signature format")))
+                    .unwrap());
+            }
+        };
+
+        let mut mac = HmacSha256::new_from_slice(self.config.avatar_proxy_secret.as_bytes())
+            .expect("HMAC can take key of any size");
+
+        mac.update(server_name.as_bytes());
+        mac.update(b"/");
+        mac.update(media_id.as_bytes());
+        mac.update(b"?exp=");
+        mac.update(exp_str.as_bytes());
+
+        if mac.verify_slice(&provided_sig_bytes).is_err() {
+            tracing::warn!(
+                "Failed HMAC validation for avatar {}/{}",
+                server_name,
+                media_id
+            );
+            return Ok(Response::builder()
+                .status(StatusCode::FORBIDDEN)
+                .body(Full::new(Bytes::from("Invalid signature")))
+                .unwrap());
+        }
+
+        let mxc_url = format!("mxc://{}/{}", server_name, media_id);
+
+        if let Some(data) = self.cache.m_avatars.get(&mxc_url) {
+            let content_type = Self::guess_mime_type(&data);
+            return Ok(Response::builder()
+                .status(StatusCode::OK)
+                .header("Content-Type", content_type)
+                .header("Cache-Control", "public, max-age=86400")
+                .body(Full::new(Bytes::from(data)))
+                .unwrap());
+        }
+
+        match self.matrix.download_media(&mxc_url).await {
+            Ok(data) => {
+                self.cache.m_avatars.insert(mxc_url, data.clone());
+
+                let content_type = Self::guess_mime_type(&data);
+
+                Ok(Response::builder()
+                    .status(StatusCode::OK)
+                    .header("Content-Type", content_type)
+                    .header("Cache-Control", "public, max-age=86400")
+                    .body(Full::new(Bytes::from(data)))
+                    .unwrap())
+            }
+            Err(e) => {
+                tracing::error!("Failed to fetch avatar for proxy: {}", e);
+                Ok(Response::builder()
+                    .status(StatusCode::NOT_FOUND)
+                    .body(Full::new(Bytes::from("Avatar not found")))
+                    .unwrap())
+            }
+        }
+    }
+
+    fn guess_mime_type(data: &[u8]) -> &'static str {
+        if data.starts_with(b"\x89PNG\r\n\x1a\n") {
+            "image/png"
+        } else if data.starts_with(b"\xFF\xD8\xFF") {
+            "image/jpeg"
+        } else if data.starts_with(b"GIF87a") || data.starts_with(b"GIF89a") {
+            "image/gif"
+        } else if data.starts_with(b"RIFF") && data.len() > 11 && &data[8..12] == b"WEBP" {
+            "image/webp"
+        } else {
+            "application/octet-stream"
+        }
+    }
 }

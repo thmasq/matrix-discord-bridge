@@ -5,6 +5,8 @@ use crate::{
     discord_client::AttachmentInfo,
     error::{BridgeError, Result},
 };
+use hmac::KeyInit;
+use hmac::{Hmac, Mac};
 use http_body_util::{BodyExt, Full};
 use hyper::{Method, Request as HyperRequest, Uri, body::Bytes};
 use hyper_util::client::legacy::{Client, connect::HttpConnector};
@@ -12,8 +14,11 @@ use pulldown_cmark::TagEnd;
 use pulldown_cmark::{Event, Options, Parser, Tag, html};
 use ruma::{OwnedRoomId, events::room::message::RoomMessageEventContent};
 use serde_json::{Value, json};
-use std::fmt::Write;
-use std::{collections::HashMap, sync::OnceLock};
+use sha2::Sha256;
+use std::{collections::HashMap, sync::OnceLock, time::UNIX_EPOCH};
+use std::{fmt::Write, time::SystemTime};
+
+type HmacSha256 = Hmac<Sha256>;
 
 static EMOTE_REGEX: OnceLock<regex::Regex> = OnceLock::new();
 
@@ -223,6 +228,13 @@ impl MatrixClient {
             .parse()
             .map_err(|e| BridgeError::Matrix(format!("Invalid avatar URL '{url}': {e}")))?;
 
+        if !Self::is_trusted_discord_url(&uri) {
+            tracing::warn!("Blocked attempt to download from untrusted URL: {}", url);
+            return Err(BridgeError::Matrix(
+                "Refused to fetch from untrusted domain".to_string(),
+            ));
+        }
+
         let req = HyperRequest::builder()
             .method(Method::GET)
             .uri(uri)
@@ -293,9 +305,35 @@ impl MatrixClient {
             return None;
         }
 
+        let server_name = parts[0];
+        let media_id = parts[1];
+
+        let exp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            + (86400 * 2); // 2 days
+
+        let exp_str = exp.to_string();
+
+        let mut mac = HmacSha256::new_from_slice(self.config.avatar_proxy_secret.as_bytes())
+            .expect("HMAC can take key of any size");
+
+        mac.update(server_name.as_bytes());
+        mac.update(b"/");
+        mac.update(media_id.as_bytes());
+        mac.update(b"?exp=");
+        mac.update(exp_str.as_bytes());
+
+        let signature = hex::encode(mac.finalize().into_bytes());
+
         Some(format!(
-            "https://{}/_matrix/client/v1/media/download/{}/{}",
-            self.config.server_name, parts[0], parts[1]
+            "{}/avatar/{}/{}?exp={}&sig={}",
+            self.config.avatar_public_url.trim_end_matches('/'),
+            server_name,
+            media_id,
+            exp_str,
+            signature
         ))
     }
 
@@ -316,11 +354,8 @@ impl MatrixClient {
     }
     pub async fn resolve_room_alias(&self, alias: &str) -> Result<String> {
         // Check cache first
-        {
-            let rooms = self.cache.m_rooms.read();
-            if let Some(room_id) = rooms.get(alias) {
-                return Ok(room_id.clone());
-            }
+        if let Some(room_id) = self.cache.m_rooms.get(alias) {
+            return Ok(room_id.clone());
         }
 
         // Query homeserver
@@ -341,7 +376,6 @@ impl MatrixClient {
         // Cache it
         self.cache
             .m_rooms
-            .write()
             .insert(alias.to_string(), room_id.clone());
 
         Ok(room_id)
@@ -396,10 +430,7 @@ impl MatrixClient {
 
                 let emote_url = format!("https://cdn.discordapp.com/emojis/{emote_id}.png");
 
-                let mxc_url = {
-                    let cache = self.cache.m_emotes.read();
-                    cache.get(emote_name).cloned()
-                };
+                let mxc_url = self.cache.m_emotes.get(emote_name).map(|r| r);
 
                 let mxc_url = if let Some(mxc) = mxc_url {
                     mxc
@@ -408,7 +439,6 @@ impl MatrixClient {
                         Ok(mxc) => {
                             self.cache
                                 .m_emotes
-                                .write()
                                 .insert(emote_name.to_string(), mxc.clone());
                             mxc
                         }
@@ -612,47 +642,63 @@ impl MatrixClient {
         mxid: &str,
         attachment: &AttachmentInfo,
     ) -> Result<String> {
-        // Download the attachment
-        let uri: Uri = attachment.url.parse().unwrap();
-        let req = HyperRequest::builder()
-            .uri(uri)
-            .body(Full::new(Bytes::new()))
-            .unwrap();
+        let uri: hyper::Uri = attachment
+            .url
+            .parse()
+            .map_err(|_| BridgeError::Matrix("Invalid attachment URL format".to_string()))?;
 
-        let res = self.http_client.request(req).await?;
-        let bytes = res.collect().await?.to_bytes();
+        if !Self::is_trusted_discord_url(&uri) {
+            tracing::warn!(
+                "Blocked attempt to download attachment from untrusted URL: {}",
+                attachment.url
+            );
+            return Err(BridgeError::Matrix(
+                "Refused to fetch from untrusted domain".to_string(),
+            ));
+        }
+
+        let http_client = reqwest::Client::new();
+
+        let res = http_client.get(&attachment.url).send().await.map_err(|e| {
+            BridgeError::Matrix(format!("Failed to fetch attachment from Discord: {e}"))
+        })?;
+
+        let file_body = reqwest::Body::wrap_stream(res.bytes_stream());
 
         let upload_url = format!("{}/_matrix/media/v3/upload", self.config.homeserver);
 
-        let mut upload_req = HyperRequest::builder()
-            .method(Method::POST)
-            .uri(upload_url)
-            .header("Authorization", format!("Bearer {}", self.config.as_token));
+        let content_type = attachment
+            .content_type
+            .as_deref()
+            .unwrap_or("application/octet-stream");
 
-        // Set content type if available
-        if let Some(ref content_type) = attachment.content_type {
-            upload_req = upload_req.header("Content-Type", content_type);
-        } else {
-            upload_req = upload_req.header("Content-Type", "application/octet-stream");
-        }
+        let upload_res = http_client
+            .post(&upload_url)
+            .header("Authorization", format!("Bearer {}", self.config.as_token))
+            .header("Content-Type", content_type)
+            .header("Content-Length", attachment.size.to_string())
+            .body(file_body)
+            .send()
+            .await
+            .map_err(|e| BridgeError::Matrix(format!("Upload failed: {e}")))?;
 
-        let upload_req = upload_req.body(Full::new(bytes.clone())).unwrap();
-
-        let res = self.http_client.request(upload_req).await?;
-
-        if res.status() != hyper::StatusCode::OK {
+        if !upload_res.status().is_success() {
             return Err(BridgeError::Matrix(format!(
                 "Failed to upload attachment: {}",
-                res.status()
+                upload_res.status()
             )));
         }
 
-        let body = res.collect().await?.to_bytes();
-        let upload_resp: Value = serde_json::from_slice(&body)?;
+        let upload_resp: Value = upload_res
+            .json()
+            .await
+            .map_err(|e| BridgeError::Matrix(format!("Failed to parse upload response: {e}")))?;
+
         let mxc_url = upload_resp["content_uri"].as_str().unwrap();
 
         // Determine message type based on content type
-        let (msgtype, extra_info) = Self::determine_media_type(attachment, mxc_url, bytes.len());
+        let (msgtype, extra_info) =
+            Self::determine_media_type(attachment, mxc_url, attachment.size as usize);
 
         let mut content = json!({
             "msgtype": msgtype,
@@ -824,7 +870,6 @@ impl MatrixClient {
         if !emojis.is_empty() {
             self.cache
                 .m_custom_emojis
-                .write()
                 .insert(room_id.to_string(), emojis.clone());
         }
 
@@ -881,11 +926,8 @@ impl MatrixClient {
     /// Get cached custom emojis for a room, or fetch if not cached
     pub async fn get_room_emojis(&self, room_id: &str) -> Result<HashMap<String, String>> {
         // Check cache first
-        {
-            let cache = self.cache.m_custom_emojis.read();
-            if let Some(emojis) = cache.get(room_id) {
-                return Ok(emojis.clone());
-            }
+        if let Some(emojis) = self.cache.m_custom_emojis.get(room_id) {
+            return Ok(emojis.clone());
         }
 
         // Fetch and cache
@@ -901,6 +943,17 @@ impl MatrixClient {
     ) -> Result<String> {
         // Download the sticker
         let uri: Uri = sticker_url.parse().unwrap();
+
+        if !Self::is_trusted_discord_url(&uri) {
+            tracing::warn!(
+                "Blocked attempt to download sticker from untrusted URL: {}",
+                sticker_url
+            );
+            return Err(BridgeError::Matrix(
+                "Refused to fetch from untrusted domain".to_string(),
+            ));
+        }
+
         let req = HyperRequest::builder()
             .uri(uri)
             .body(Full::new(Bytes::new()))
@@ -981,11 +1034,8 @@ impl MatrixClient {
 
     pub async fn is_user_in_room(&self, room_id: &str, mxid: &str) -> Result<bool> {
         // First check the cache
-        {
-            let members = self.cache.m_members.read();
-            if let Some(room_members) = members.get(room_id)
-                && room_members.contains_key(mxid)
-            {
+        if let Some(room_members) = self.cache.m_members.get(room_id) {
+            if room_members.contains_key(mxid) {
                 return Ok(true);
             }
         }
@@ -1044,5 +1094,17 @@ impl MatrixClient {
         )
         .await?;
         Ok(())
+    }
+
+    /// Validates that a given URI points to a trusted Discord media domain
+    fn is_trusted_discord_url(uri: &hyper::Uri) -> bool {
+        if uri.scheme_str() != Some("https") {
+            return false;
+        }
+
+        match uri.host() {
+            Some(host) => host == "cdn.discordapp.com" || host == "media.discordapp.net",
+            None => false,
+        }
     }
 }

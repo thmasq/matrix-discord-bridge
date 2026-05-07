@@ -13,6 +13,8 @@ pub struct Config {
     pub database: PathBuf,
     #[allow(clippy::struct_field_names)]
     pub config_room_id: Option<String>,
+    pub avatar_public_url: String,
+    pub avatar_proxy_secret: String,
 }
 
 impl Config {
@@ -32,6 +34,8 @@ impl Config {
             port: 5000,
             database: PathBuf::from("bridge.db"),
             config_room_id: None,
+            avatar_public_url: "avatar.YOURDOMAIN.HERE".to_string(),
+            avatar_proxy_secret: "CHANGE_ME_TO_A_RANDOM_LONG_STRING".to_string(),
         };
 
         let content = serde_json::to_string_pretty(&default)?;
