@@ -1,15 +1,75 @@
 use crate::{cache::Cache, config::Config, db::Database, matrix_client::MatrixClient};
+use clap::{Parser, Subcommand};
 use ruma::events::room::message::RoomMessageEventContent;
 use serde_json::Value;
 use std::fmt::Write;
 use std::sync::Arc;
 
-pub struct AdminCommandHandler {
-    config: Config,
-    matrix: Arc<MatrixClient>,
-    db: Database,
-    cache: Cache,
-    discord_http: reqwest::Client,
+#[derive(Parser, Debug)]
+#[command(
+    name = "!",
+    about = "Bridge Admin Commands",
+    disable_help_subcommand = true
+)]
+pub struct AdminCli {
+    #[command(subcommand)]
+    pub command: AdminCommand,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum AdminCommand {
+    /// Manage room-to-channel links and config
+    Bridge {
+        #[command(subcommand)]
+        action: BridgeAction,
+    },
+    /// Manage bot invitations
+    Invite {
+        #[command(subcommand)]
+        action: InviteAction,
+    },
+    /// Utility commands
+    Util {
+        #[command(subcommand)]
+        action: UtilAction,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum BridgeAction {
+    /// Create a new bridge
+    Link {
+        matrix_room_id: String,
+        discord_channel_id: String,
+    },
+    /// Remove a bridge
+    Unlink { matrix_room_id: String },
+    /// List all current bridges
+    List,
+    /// Show bridge status for a room
+    Status { matrix_room_id: String },
+    /// Configure bridge settings
+    Config {
+        matrix_room_id: String,
+        setting: Option<String>,
+        value: Option<String>,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum InviteAction {
+    /// List pending bot invites
+    List,
+    /// Accept a pending invite (e.g., 1-3 or 4,5)
+    Accept { id_or_ranges: String },
+    /// Reject/delete invites (e.g., 1-3 or 4,5)
+    Delete { id_or_ranges: String },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum UtilAction {
+    /// Verify if bot has access to a Discord channel
+    Verify { discord_channel_id: String },
 }
 
 #[derive(Debug, Clone)]
@@ -18,6 +78,14 @@ struct ChannelInfo {
     name: String,
     guild_id: Option<String>,
     channel_type: u8,
+}
+
+pub struct AdminCommandHandler {
+    config: Config,
+    matrix: Arc<MatrixClient>,
+    db: Database,
+    cache: Cache,
+    discord_http: reqwest::Client,
 }
 
 impl AdminCommandHandler {
@@ -53,57 +121,89 @@ impl AdminCommandHandler {
             return Ok(());
         }
 
-        let parts: Vec<&str> = body.split_whitespace().collect();
-        if parts.is_empty() {
+        let body = body.trim();
+        if !body.starts_with('!') {
             return Ok(());
         }
 
-        let command = parts[0].trim_start_matches('!');
+        let body_stripped = body.strip_prefix('!').unwrap_or(body);
 
-        let response = match command {
-            "help" => Self::cmd_help(),
-            "list" => self.cmd_list().await,
-            "link" => self.cmd_link(sender, &parts[1..]).await,
-            "unlink" => self.cmd_unlink(&parts[1..]).await,
-            "config" => self.cmd_config(&parts[1..]).await,
-            "status" => self.cmd_status(&parts[1..]).await,
-            "verify" => self.cmd_verify(&parts[1..]).await,
-            "invite" => self.cmd_invite(&parts[1..]).await,
-            _ => return Ok(()), // Unknown command, ignore
+        // Parse shell-like string with quotes
+        let Some(mut args) = shlex::split(body_stripped) else {
+            let response = "Error: Invalid command format. Please check your quotes.".to_string();
+            return self.send_response(room_id, &response).await;
         };
 
+        if args.is_empty() {
+            return Ok(());
+        }
+
+        // Prepend dummy binary name for clap
+        args.insert(0, "bot".to_string());
+
+        let cli = match AdminCli::try_parse_from(args) {
+            Ok(cli) => cli,
+            Err(e) => {
+                // Send clap auto-generated help or error messages inside a code block
+                let response = format!(
+                    "<pre><code>{}</code></pre>",
+                    html_escape::encode_text(&e.to_string())
+                );
+                // Bypass MatrixClient processing since it's already pre-formatted HTML
+                let plain_body = e.to_string();
+                let content = RoomMessageEventContent::text_html(plain_body, response);
+                let _ = self.matrix.send_message(room_id, content, None).await;
+                return Ok(());
+            }
+        };
+
+        let response = match cli.command {
+            AdminCommand::Bridge { action } => match action {
+                BridgeAction::Link {
+                    matrix_room_id,
+                    discord_channel_id,
+                } => {
+                    self.cmd_link(sender, &matrix_room_id, &discord_channel_id)
+                        .await
+                }
+                BridgeAction::Unlink { matrix_room_id } => self.cmd_unlink(&matrix_room_id).await,
+                BridgeAction::List => self.cmd_list().await,
+                BridgeAction::Status { matrix_room_id } => self.cmd_status(&matrix_room_id).await,
+                BridgeAction::Config {
+                    matrix_room_id,
+                    setting,
+                    value,
+                } => {
+                    self.cmd_config(&matrix_room_id, setting.as_deref(), value.as_deref())
+                        .await
+                }
+            },
+            AdminCommand::Invite { action } => match action {
+                InviteAction::List => self.cmd_invite_list().await,
+                InviteAction::Accept { id_or_ranges } => {
+                    self.cmd_invite_accept(&id_or_ranges).await
+                }
+                InviteAction::Delete { id_or_ranges } => {
+                    self.cmd_invite_delete(&id_or_ranges).await
+                }
+            },
+            AdminCommand::Util { action } => match action {
+                UtilAction::Verify { discord_channel_id } => {
+                    self.cmd_verify(&discord_channel_id).await
+                }
+            },
+        };
+
+        self.send_response(room_id, &response).await
+    }
+
+    async fn send_response(&self, room_id: &str, text: &str) -> crate::error::Result<()> {
         let (plain_body, html_body) =
-            MatrixClient::process_for_matrix(&response, &std::collections::HashMap::new());
+            MatrixClient::process_for_matrix(text, &std::collections::HashMap::new());
 
         let content = RoomMessageEventContent::text_html(plain_body, html_body);
         let _ = self.matrix.send_message(room_id, content, None).await;
-
         Ok(())
-    }
-
-    fn cmd_help() -> String {
-        r"### -- Bridge Admin Commands --
-> \-  **!help** - Show this help message
-> 
-> \-  **!list** - List all current bridges
-> 
-> \-  **!link** <_matrix\_room\_id_> <_discord\_channel\_id_> - Create a new bridge
-> Example: `!link !abc123:matrix.org 123456789012345678`
-> 
-> \-  **!config** <_matrix\_room\_id_> [setting] [value] - Configure bridge settings
-> \-  **!unlink** <_matrix\_room\_id_> - Remove a bridge
-> Example: `!unlink !abc123:matrix.org`
-> 
-> \-  **!status** <_matrix\_room\_id_> - Show bridge status for a room
-> Example: `!status !abc123:matrix.org`
-> 
-> \-  **!verify** <_discord\_channel\_id_> - Verify if bot has access to a Discord channel
-> Example: `!verify 123456789012345678`
-> 
-> \-  **!invite list** - List pending bot invites
-> \-  **!invite accept** <id> - Accept a pending invite
-> \-  **!invite delete** <ids> - Reject/delete invites (e.g., 2-4 or 5,6)"
-            .to_string()
     }
 
     async fn cmd_list(&self) -> String {
@@ -127,14 +227,7 @@ impl AdminCommandHandler {
         }
     }
 
-    async fn cmd_link(&self, _sender: &str, args: &[&str]) -> String {
-        if args.len() < 2 {
-            return "Usage: !link <matrix_room_id> <discord_channel_id>".to_string();
-        }
-
-        let room_id = args[0];
-        let channel_id = args[1];
-
+    async fn cmd_link(&self, _sender: &str, room_id: &str, channel_id: &str) -> String {
         // Validate Matrix room ID format
         if !room_id.starts_with('!') || !room_id.contains(':') {
             return "Invalid Matrix room ID format. Should be like: !abc123:matrix.org".to_string();
@@ -147,13 +240,9 @@ impl AdminCommandHandler {
 
         // Check if room is already bridged
         match self.db.get_channel(room_id).await {
-            Ok(Some(_)) => {
-                return format!("Matrix room `{room_id}` is already bridged.");
-            }
+            Ok(Some(_)) => return format!("Matrix room `{room_id}` is already bridged."),
             Ok(None) => {}
-            Err(e) => {
-                return format!("Database error: {e}");
-            }
+            Err(e) => return format!("Database error: {e}"),
         }
 
         // Check if Discord channel is already bridged
@@ -165,9 +254,7 @@ impl AdminCommandHandler {
                     );
                 }
             }
-            Err(e) => {
-                return format!("Database error: {e}");
-            }
+            Err(e) => return format!("Database error: {e}"),
         }
 
         // Verify Discord channel access
@@ -202,19 +289,11 @@ impl AdminCommandHandler {
                     Err(e) => format!("Failed to create bridge: {e}"),
                 }
             }
-            Err(e) => {
-                format!("Failed to verify Discord channel `{channel_id}`:\n{e}")
-            }
+            Err(e) => format!("Failed to verify Discord channel `{channel_id}`:\n{e}"),
         }
     }
 
-    async fn cmd_unlink(&self, args: &[&str]) -> String {
-        if args.is_empty() {
-            return "Usage: !unlink <matrix_room_id>".to_string();
-        }
-
-        let room_id = args[0];
-
+    async fn cmd_unlink(&self, room_id: &str) -> String {
         // Check if bridge exists
         match self.db.get_channel(room_id).await {
             Ok(Some(channel_id)) => match self.db.remove_room(room_id).await {
@@ -232,13 +311,7 @@ impl AdminCommandHandler {
         }
     }
 
-    async fn cmd_status(&self, args: &[&str]) -> String {
-        if args.is_empty() {
-            return "Usage: !status <matrix_room_id>".to_string();
-        }
-
-        let room_id = args[0];
-
+    async fn cmd_status(&self, room_id: &str) -> String {
         match self.db.get_channel(room_id).await {
             Ok(Some(channel_id)) => {
                 // Get Discord channel info
@@ -281,13 +354,7 @@ impl AdminCommandHandler {
         }
     }
 
-    async fn cmd_verify(&self, args: &[&str]) -> String {
-        if args.is_empty() {
-            return "Usage: !verify <discord_channel_id>".to_string();
-        }
-
-        let channel_id = args[0];
-
+    async fn cmd_verify(&self, channel_id: &str) -> String {
         if !channel_id.chars().all(|c| c.is_ascii_digit()) {
             return "Invalid Discord channel ID format. Should be numeric.".to_string();
         }
@@ -368,92 +435,87 @@ impl AdminCommandHandler {
         })
     }
 
-    async fn cmd_invite(&self, args: &[&str]) -> String {
-        if args.is_empty() {
-            return "Usage: `!invite <list|accept|delete> [args]`".to_string();
-        }
-
+    async fn cmd_invite_list(&self) -> String {
         let invites = match self.db.list_invites().await {
             Ok(invs) => invs,
             Err(e) => return format!("Database error: {e}"),
         };
 
-        match args[0] {
-            "list" => {
-                if invites.is_empty() {
-                    "No pending invites.".to_string()
-                } else {
-                    let mut response = "**Pending Invites:**\n\n".to_string();
-                    for inv in &invites {
-                        let name_part = inv
-                            .room_name
-                            .as_deref()
-                            .map(|n| format!(" `{n}`"))
-                            .unwrap_or_default();
+        if invites.is_empty() {
+            "No pending invites.".to_string()
+        } else {
+            let mut response = "**Pending Invites:**\n\n".to_string();
+            for inv in &invites {
+                let name_part = inv
+                    .room_name
+                    .as_deref()
+                    .map(|n| format!(" `{n}`"))
+                    .unwrap_or_default();
 
-                        let _ = writeln!(
-                            response,
-                            "- **room**: \"{}\", **id**: \"{}\" (from `{}`)",
-                            name_part, inv.room_id, inv.sender
-                        );
-                    }
-                    response
-                }
+                let _ = writeln!(
+                    response,
+                    "- **room**: \"{}\", **id**: \"{}\" (from `{}`)",
+                    name_part, inv.room_id, inv.sender
+                );
             }
-            "accept" => {
-                if args.len() < 2 {
-                    return "Usage: `!invite accept <id_or_ranges>` (e.g. 1-3 or 4,5)".to_string();
-                }
+            response
+        }
+    }
 
-                let indices = Self::parse_indices(&args[1..].join(""), invites.len());
-                if indices.is_empty() {
-                    return "No valid invites found for the given range.".to_string();
-                }
+    async fn cmd_invite_accept(&self, id_or_ranges: &str) -> String {
+        let invites = match self.db.list_invites().await {
+            Ok(invs) => invs,
+            Err(e) => return format!("Database error: {e}"),
+        };
 
-                let mut success_count = 0;
-                let mut err_msgs = Vec::new();
+        let indices = Self::parse_indices(id_or_ranges, invites.len());
+        if indices.is_empty() {
+            return "No valid invites found for the given range.".to_string();
+        }
 
-                for &idx in &indices {
-                    let invite = &invites[idx - 1];
-                    match self.matrix.join_room(&invite.room_id, None).await {
-                        Ok(()) => {
-                            let _ = self.db.remove_invite(invite.id).await;
-                            success_count += 1;
-                        }
-                        Err(e) => {
-                            err_msgs.push(format!("Failed to join {}: {}", invite.room_id, e));
-                        }
-                    }
-                }
+        let mut success_count = 0;
+        let mut err_msgs = Vec::new();
 
-                let mut resp = format!("Accepted {success_count} invite(s).");
-                if !err_msgs.is_empty() {
-                    resp.push_str("\nErrors:\n");
-                    resp.push_str(&err_msgs.join("\n"));
-                }
-                resp
-            }
-            "delete" => {
-                if args.len() < 2 {
-                    return "Usage: `!invite delete <id_or_ranges>` (e.g. 1-3 or 4,5)".to_string();
-                }
-
-                let indices = Self::parse_indices(&args[1..].join(""), invites.len());
-                if indices.is_empty() {
-                    return "No valid invites found for the given range.".to_string();
-                }
-
-                let mut success_count = 0;
-                for &idx in &indices {
-                    let invite = &invites[idx - 1];
-                    let _ = self.matrix.leave_room(&invite.room_id, None).await;
+        for &idx in &indices {
+            let invite = &invites[idx - 1];
+            match self.matrix.join_room(&invite.room_id, None).await {
+                Ok(()) => {
                     let _ = self.db.remove_invite(invite.id).await;
                     success_count += 1;
                 }
-                format!("Deleted {success_count} invite(s).")
+                Err(e) => {
+                    err_msgs.push(format!("Failed to join {}: {}", invite.room_id, e));
+                }
             }
-            _ => "Unknown invite action. Use `list`, `accept`, or `delete`.".to_string(),
         }
+
+        let mut resp = format!("Accepted {success_count} invite(s).");
+        if !err_msgs.is_empty() {
+            resp.push_str("\nErrors:\n");
+            resp.push_str(&err_msgs.join("\n"));
+        }
+        resp
+    }
+
+    async fn cmd_invite_delete(&self, id_or_ranges: &str) -> String {
+        let invites = match self.db.list_invites().await {
+            Ok(invs) => invs,
+            Err(e) => return format!("Database error: {e}"),
+        };
+
+        let indices = Self::parse_indices(id_or_ranges, invites.len());
+        if indices.is_empty() {
+            return "No valid invites found for the given range.".to_string();
+        }
+
+        let mut success_count = 0;
+        for &idx in &indices {
+            let invite = &invites[idx - 1];
+            let _ = self.matrix.leave_room(&invite.room_id, None).await;
+            let _ = self.db.remove_invite(invite.id).await;
+            success_count += 1;
+        }
+        format!("Deleted {success_count} invite(s).")
     }
 
     fn parse_indices(input: &str, max_val: usize) -> Vec<usize> {
@@ -480,27 +542,27 @@ impl AdminCommandHandler {
         result
     }
 
-    async fn cmd_config(&self, args: &[&str]) -> String {
-        if args.is_empty() {
-            return "Usage: `!config <matrix_room_id> [setting] [value]`\nSettings: `d2m_enabled`, `m2d_enabled`, `d2m_mod_deletions`, `m2d_mod_deletions`, `d2m_typing`, `m2d_typing`".to_string();
-        }
-
-        let room_id = args[0];
+    async fn cmd_config(
+        &self,
+        room_id: &str,
+        setting: Option<&str>,
+        value: Option<&str>,
+    ) -> String {
         let bridge = match self.db.get_bridge(room_id).await {
             Ok(Some(b)) => b,
             Ok(None) => return format!("No bridge found for room `{room_id}`"),
             Err(e) => return format!("Database error: {e}"),
         };
 
-        if args.len() == 1 {
+        if setting.is_none() || value.is_none() {
             return format!(
                 "**Configuration for {}**\n\
-                            `d2m_enabled`: {}\n\
-                            `m2d_enabled`: {}\n\
-                            `d2m_mod_deletions`: {}\n\
-                            `m2d_mod_deletions`: {}\n\
-                            `d2m_typing`: {}\n\
-                            `m2d_typing`: {}",
+                `d2m_enabled`: {}\n\
+                `m2d_enabled`: {}\n\
+                `d2m_mod_deletions`: {}\n\
+                `m2d_mod_deletions`: {}\n\
+                `d2m_typing`: {}\n\
+                `m2d_typing`: {}",
                 room_id,
                 bridge.d2m_enabled,
                 bridge.m2d_enabled,
@@ -511,22 +573,22 @@ impl AdminCommandHandler {
             );
         }
 
-        if args.len() < 3 {
-            return "Usage: `!config <matrix_room_id> <setting> <true/false>`".to_string();
-        }
-
-        let setting = args[1];
-        let value_str = args[2].to_lowercase();
-        let value = match value_str.as_str() {
+        let setting = setting.unwrap();
+        let value_str = value.unwrap().to_lowercase();
+        let val_bool = match value_str.as_str() {
             "true" | "1" | "yes" | "on" => true,
             "false" | "0" | "no" | "off" => false,
             _ => return "Value must be true or false".to_string(),
         };
 
-        if let Err(e) = self.db.update_bridge_config(room_id, setting, value).await {
+        if let Err(e) = self
+            .db
+            .update_bridge_config(room_id, setting, val_bool)
+            .await
+        {
             return format!("Failed to update config: {e}");
         }
 
-        format!("Updated `{setting}` to `{value}` for bridge `{room_id}`")
+        format!("Updated `{setting}` to `{val_bool}` for bridge `{room_id}`")
     }
 }
