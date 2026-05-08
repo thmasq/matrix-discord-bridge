@@ -6,11 +6,7 @@ use std::fmt::Write;
 use std::sync::Arc;
 
 #[derive(Parser, Debug)]
-#[command(
-    name = "!",
-    about = "Bridge Admin Commands",
-    disable_help_subcommand = true
-)]
+#[command(name = "!", about = "Bridge Admin Commands")]
 pub struct AdminCli {
     #[command(subcommand)]
     pub command: AdminCommand,
