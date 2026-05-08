@@ -21,6 +21,7 @@ use tokio::{
     net::TcpListener,
     sync::{Mutex, mpsc},
 };
+use tracing::info;
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -965,6 +966,8 @@ impl AppService {
         let url = format!(
             "https://discord.com/api/v10/channels/{channel_id}/messages/{discord_msg_id}/reactions/{discord_emoji}/@me"
         );
+
+        info!("Adding reaction with {url}");
 
         let response = self
             .discord_http
