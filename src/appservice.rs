@@ -957,7 +957,7 @@ impl AppService {
             }
 
             if resolved_discord_emoji.is_none() {
-                if let Some(room_emojis) = self.cache.m_custom_emojis.get(room_id) {
+                if let Ok(room_emojis) = self.matrix.get_room_emojis(room_id).await {
                     for (shortcode, mxc) in room_emojis {
                         if mxc == reaction_key {
                             if let Some(discord_format) = self.cache.d_emotes.get(&shortcode) {
