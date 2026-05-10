@@ -623,22 +623,33 @@ impl EventHandler for DiscordHandler {
         tracing::info!("Discord bot connected as {}", ready.user.name);
     }
 
-    async fn guild_create(&self, _ctx: Context, guild: Guild, _is_new: Option<bool>) {
+    async fn guild_create(&self, ctx: Context, guild: Guild, _is_new: Option<bool>) {
         tracing::info!("Guild available: {} ({})", guild.name, guild.id);
 
         let guild_id_str = guild.id.to_string();
 
         // Cache emotes
-        let emote_count = guild.emojis.len();
-        for (emoji_id, emoji) in &guild.emojis {
-            let emote_str = if emoji.animated {
-                format!("<a:{}:{}>", emoji.name, emoji_id)
-            } else {
-                format!("<:{}:{}>", emoji.name, emoji_id)
-            };
-            self.cache.d_emotes.insert(emoji.name.clone(), emote_str);
+        match guild.id.emojis(&ctx.http).await {
+            Ok(emojis) => {
+                let emote_count = emojis.len();
+                for emoji in emojis {
+                    let emote_str = if emoji.animated {
+                        format!("<a:{}:{}>", emoji.name, emoji.id)
+                    } else {
+                        format!("<:{}:{}>", emoji.name, emoji.id)
+                    };
+                    self.cache.d_emotes.insert(emoji.name.clone(), emote_str);
+                }
+                tracing::info!("Cached {} emotes from guild {}", emote_count, guild.id);
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "Failed to fetch emojis via HTTP for guild {}: {}",
+                    guild.id,
+                    e
+                );
+            }
         }
-        tracing::debug!("Cached {} emotes from guild {}", emote_count, guild.id);
 
         // Cache roles
         let role_count = guild.roles.len();

@@ -793,58 +793,87 @@ impl MatrixClient {
     pub async fn fetch_room_emojis(&self, room_id: &str) -> Result<HashMap<String, String>> {
         let mut emojis = HashMap::new();
 
-        // Try to get im.ponies.emote_rooms state event
-        let resp = self
-            .send_request(
-                Method::GET,
-                &format!(
-                    "/rooms/{}/state/im.ponies.emote_rooms",
-                    urlencoding::encode(room_id)
-                ),
-                None,
-                None,
-            )
-            .await;
-
-        if let Ok(state_event) = resp {
-            // Parse the emote rooms
+        let mut parse_emote_state = |state_event: &Value| {
             if let Some(rooms) = state_event["rooms"].as_object() {
                 for (_room_key, room_data) in rooms {
                     if let Some(images) = room_data["images"].as_object() {
                         for (shortcode, image_data) in images {
                             if let Some(url) = image_data["url"].as_str() {
-                                emojis.insert(shortcode.clone(), url.to_string());
+                                emojis
+                                    .entry(shortcode.clone())
+                                    .or_insert_with(|| url.to_string());
                             }
                         }
                     }
                 }
             }
-        }
+            if let Some(images) = state_event["images"].as_object() {
+                for (shortcode, image_data) in images {
+                    if let Some(url) = image_data["url"].as_str() {
+                        emojis
+                            .entry(shortcode.clone())
+                            .or_insert_with(|| url.to_string());
+                    }
+                }
+            }
+        };
 
-        // Also try im.ponies.room_emotes (alternative format)
-        let resp = self
+        let state_resp = self
             .send_request(
                 Method::GET,
-                &format!(
-                    "/rooms/{}/state/im.ponies.room_emotes",
-                    urlencoding::encode(room_id)
-                ),
+                &format!("/rooms/{}/state", urlencoding::encode(room_id)),
                 None,
                 None,
             )
             .await;
 
-        if let Ok(state_event) = resp
-            && let Some(images) = state_event["images"].as_object()
-        {
-            for (shortcode, image_data) in images {
-                if let Some(url) = image_data["url"].as_str() {
-                    emojis.insert(shortcode.clone(), url.to_string());
+        if let Ok(Value::Array(state_events)) = state_resp {
+            let mut parent_spaces = Vec::new();
+
+            for event in &state_events {
+                let event_type = event["type"].as_str().unwrap_or("");
+
+                if event_type == "im.ponies.emote_rooms" || event_type == "im.ponies.room_emotes" {
+                    parse_emote_state(event);
+                } else if event_type == "m.space.parent" {
+                    if let Some(parent_room_id) = event["state_key"].as_str() {
+                        parent_spaces.push(parent_room_id.to_string());
+                    }
+                }
+            }
+
+            for parent_room_id in parent_spaces {
+                if let Ok(parent_state) = self
+                    .send_request(
+                        Method::GET,
+                        &format!(
+                            "/rooms/{}/state/im.ponies.emote_rooms",
+                            urlencoding::encode(&parent_room_id)
+                        ),
+                        None,
+                        None,
+                    )
+                    .await
+                {
+                    parse_emote_state(&parent_state);
+                }
+                if let Ok(parent_state) = self
+                    .send_request(
+                        Method::GET,
+                        &format!(
+                            "/rooms/{}/state/im.ponies.room_emotes",
+                            urlencoding::encode(&parent_room_id)
+                        ),
+                        None,
+                        None,
+                    )
+                    .await
+                {
+                    parse_emote_state(&parent_state);
                 }
             }
         }
 
-        // Cache the results
         if !emojis.is_empty() {
             self.cache
                 .m_custom_emojis
