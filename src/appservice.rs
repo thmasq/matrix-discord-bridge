@@ -21,7 +21,6 @@ use tokio::{
     net::TcpListener,
     sync::{Mutex, mpsc},
 };
-use tracing::info;
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -937,23 +936,69 @@ impl AppService {
         }
         let channel_id = bridge.channel_id;
 
-        let clean_name = reaction_key.trim_matches(':');
+        let mut resolved_discord_emoji = None;
 
-        let discord_emoji = if let Some(discord_format) = self.cache.d_emotes.get(clean_name) {
-            let id_regex = ID_REGEX.get_or_init(|| regex::Regex::new(r":(\d+)>$").unwrap());
-            id_regex.captures(&discord_format).map_or_else(
-                || urlencoding::encode(reaction_key).to_string(),
-                |cap| {
+        if reaction_key.starts_with("mxc://") {
+            for (name, mxc) in &self.cache.m_emotes {
+                if mxc == reaction_key {
+                    if let Some(discord_format) = self.cache.d_emotes.get(&*name) {
+                        let id_regex =
+                            ID_REGEX.get_or_init(|| regex::Regex::new(r":(\d+)>$").unwrap());
+                        if let Some(cap) = id_regex.captures(&discord_format) {
+                            resolved_discord_emoji = Some(format!(
+                                "{}%3A{}",
+                                urlencoding::encode(&*name),
+                                cap.get(1).unwrap().as_str()
+                            ));
+                        }
+                    }
+                    break;
+                }
+            }
+
+            if resolved_discord_emoji.is_none() {
+                if let Some(room_emojis) = self.cache.m_custom_emojis.get(room_id) {
+                    for (shortcode, mxc) in room_emojis {
+                        if mxc == reaction_key {
+                            if let Some(discord_format) = self.cache.d_emotes.get(&shortcode) {
+                                let id_regex = ID_REGEX
+                                    .get_or_init(|| regex::Regex::new(r":(\d+)>$").unwrap());
+                                if let Some(cap) = id_regex.captures(&discord_format) {
+                                    resolved_discord_emoji = Some(format!(
+                                        "{}%3A{}",
+                                        urlencoding::encode(&shortcode),
+                                        cap.get(1).unwrap().as_str()
+                                    ));
+                                }
+                            }
+                            break;
+                        }
+                    }
+                }
+            }
+        } else {
+            let clean_name = reaction_key.trim_matches(':');
+
+            if let Some(discord_format) = self.cache.d_emotes.get(clean_name) {
+                let id_regex = ID_REGEX.get_or_init(|| regex::Regex::new(r":(\d+)>$").unwrap());
+                resolved_discord_emoji = id_regex.captures(&discord_format).map(|cap| {
                     format!(
                         "{}%3A{}",
                         urlencoding::encode(clean_name),
                         cap.get(1).unwrap().as_str()
                     )
-                },
-            )
-        } else {
-            // Unicode emoji
-            urlencoding::encode(reaction_key).to_string()
+                });
+            } else {
+                resolved_discord_emoji = Some(urlencoding::encode(reaction_key).to_string());
+            }
+        }
+
+        let Some(discord_emoji) = resolved_discord_emoji else {
+            tracing::info!(
+                "Ignoring unmappable Matrix reaction key (likely a Matrix-exclusive custom emoji): {}",
+                reaction_key
+            );
+            return Ok(());
         };
 
         tracing::info!(
@@ -967,7 +1012,7 @@ impl AppService {
             "https://discord.com/api/v10/channels/{channel_id}/messages/{discord_msg_id}/reactions/{discord_emoji}/@me"
         );
 
-        info!("Adding reaction with {url}");
+        tracing::info!("Adding reaction with {url}");
 
         let response = self
             .discord_http
