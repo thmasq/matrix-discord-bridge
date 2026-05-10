@@ -65,7 +65,10 @@ pub enum InviteAction {
 #[derive(Subcommand, Debug)]
 pub enum UtilAction {
     /// Verify if bot has access to a Discord channel
-    Verify { discord_channel_id: String },
+    Verify {
+        discord_channel_id: String,
+    },
+    DebugEmojis,
 }
 
 #[derive(Debug, Clone)]
@@ -187,6 +190,7 @@ impl AdminCommandHandler {
                 UtilAction::Verify { discord_channel_id } => {
                     self.cmd_verify(&discord_channel_id).await
                 }
+                UtilAction::DebugEmojis => self.cmd_debug_emojis().await,
             },
         };
 
@@ -586,5 +590,39 @@ impl AdminCommandHandler {
         }
 
         format!("Updated `{setting}` to `{val_bool}` for bridge `{room_id}`")
+    }
+
+    async fn cmd_debug_emojis(&self) -> String {
+        tracing::info!("=== BEGIN EMOJI CACHE DUMP ===");
+
+        let d_emotes_count = self.cache.d_emotes.entry_count();
+        tracing::info!("d_emotes (Discord emojis) count: {}", d_emotes_count);
+        for (k, v) in &self.cache.d_emotes {
+            tracing::info!("  {} -> {}", k, v);
+        }
+
+        let m_emotes_count = self.cache.m_emotes.entry_count();
+        tracing::info!("m_emotes (Matrix cached uploads) count: {}", m_emotes_count);
+        for (k, v) in &self.cache.m_emotes {
+            tracing::info!("  {} -> {}", k, v);
+        }
+
+        let m_custom_count = self.cache.m_custom_emojis.entry_count();
+        tracing::info!(
+            "m_custom_emojis (Room state packs) count: {}",
+            m_custom_count
+        );
+        for (room, emojis) in &self.cache.m_custom_emojis {
+            tracing::info!("  Room: {}", room);
+            for (shortcode, mxc) in emojis {
+                tracing::info!("    {} -> {}", shortcode, mxc);
+            }
+        }
+        tracing::info!("=== END EMOJI CACHE DUMP ===");
+
+        format!(
+            "**Cache Dumped to Console!**\nDiscord Emotes: `{}`\nMatrix Cached Uploads: `{}`\nRoom Emoji Packs: `{}`",
+            d_emotes_count, m_emotes_count, m_custom_count
+        )
     }
 }
