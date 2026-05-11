@@ -1120,8 +1120,7 @@ impl EventHandler for DiscordHandler {
 
         let mxid = self.matrix.matrixify_user(&user.id.to_string(), None);
 
-        // Convert reaction emoji to string
-        let reaction_key = match &reaction.emoji {
+        let reaction_name = match &reaction.emoji {
             ReactionType::Unicode(emoji) => emoji.clone(),
             ReactionType::Custom { name, id, .. } => name
                 .as_ref()
@@ -1132,9 +1131,49 @@ impl EventHandler for DiscordHandler {
             }
         };
 
+        let matrix_reaction_key = match &reaction.emoji {
+            ReactionType::Unicode(emoji) => emoji.clone(),
+            ReactionType::Custom { animated, id, name } => {
+                let emote_name = name
+                    .as_ref()
+                    .map_or_else(|| format!("custom_{id}"), |n| n.clone());
+                let mut mxc = None;
+
+                if let Ok(room_emojis) = self.matrix.get_room_emojis(&room_id).await {
+                    if let Some(url) = room_emojis.get(&emote_name) {
+                        mxc = Some(url.clone());
+                    }
+                }
+
+                if mxc.is_none() {
+                    if let Some(url) = self.cache.m_emotes.get(&emote_name) {
+                        mxc = Some(url.clone());
+                    }
+                }
+
+                if mxc.is_none() {
+                    let ext = if *animated { "gif" } else { "png" };
+                    let discord_url = format!("https://cdn.discordapp.com/emojis/{id}.{ext}");
+
+                    if let Ok(url) = self.matrix.upload_from_url(&discord_url).await {
+                        self.cache.m_emotes.insert(emote_name.clone(), url.clone());
+                        mxc = Some(url);
+                    } else {
+                        tracing::warn!(
+                            "Failed to upload Discord emoji for reaction: {}",
+                            emote_name
+                        );
+                    }
+                }
+
+                mxc.unwrap_or(emote_name)
+            }
+            _ => return,
+        };
+
         match self
             .matrix
-            .send_reaction(&room_id, &matrix_event_id, &reaction_key, &mxid)
+            .send_reaction(&room_id, &matrix_event_id, &matrix_reaction_key, &mxid)
             .await
         {
             Ok(reaction_event_id) => {
@@ -1143,8 +1182,7 @@ impl EventHandler for DiscordHandler {
                     reaction_event_id
                 );
 
-                // Cache the reaction mapping
-                let cache_key = format!("{}:{}:{}", reaction.message_id, user.id, reaction_key);
+                let cache_key = format!("{}:{}:{}", reaction.message_id, user.id, reaction_name);
                 self.cache.d_messages.insert(cache_key, reaction_event_id);
             }
             Err(e) => {
