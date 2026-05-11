@@ -793,7 +793,9 @@ impl MatrixClient {
     pub async fn fetch_room_emojis(&self, room_id: &str) -> Result<HashMap<String, String>> {
         let mut emojis = HashMap::new();
 
-        let mut parse_emote_content = |content: &Value| {
+        let mut parse_emote_content = |content: &Value, source: &str| {
+            tracing::info!("Found emote state in {}. Raw JSON: {}", source, content);
+
             if let Some(rooms) = content["rooms"].as_object() {
                 for (_room_key, room_data) in rooms {
                     if let Some(images) = room_data["images"].as_object() {
@@ -818,6 +820,8 @@ impl MatrixClient {
             }
         };
 
+        tracing::info!("Fetching full state for room: {}", room_id);
+
         let state_resp = self
             .send_request(
                 Method::GET,
@@ -829,12 +833,14 @@ impl MatrixClient {
 
         if let Ok(Value::Array(state_events)) = state_resp {
             let mut parent_spaces = Vec::new();
+            let mut found_local_emotes = false;
 
             for event in &state_events {
                 let event_type = event["type"].as_str().unwrap_or("");
 
                 if event_type == "im.ponies.emote_rooms" || event_type == "im.ponies.room_emotes" {
-                    parse_emote_content(&event["content"]);
+                    found_local_emotes = true;
+                    parse_emote_content(&event["content"], "local room");
                 } else if event_type == "m.space.parent" {
                     if let Some(parent_room_id) = event["state_key"].as_str() {
                         parent_spaces.push(parent_room_id.to_string());
@@ -842,36 +848,52 @@ impl MatrixClient {
                 }
             }
 
+            if !found_local_emotes {
+                tracing::info!(
+                    "No local emote state events found directly in room {}.",
+                    room_id
+                );
+            }
+
+            tracing::info!("Found parent spaces to check: {:?}", parent_spaces);
+
             for parent_room_id in parent_spaces {
-                if let Ok(parent_content) = self
+                tracing::info!(
+                    "Attempting to fetch full state from parent space: {}",
+                    parent_room_id
+                );
+
+                match self
                     .send_request(
                         Method::GET,
-                        &format!(
-                            "/rooms/{}/state/im.ponies.emote_rooms",
-                            urlencoding::encode(&parent_room_id)
-                        ),
+                        &format!("/rooms/{}/state", urlencoding::encode(&parent_room_id)),
                         None,
                         None,
                     )
                     .await
                 {
-                    parse_emote_content(&parent_content);
-                }
-                if let Ok(parent_content) = self
-                    .send_request(
-                        Method::GET,
-                        &format!(
-                            "/rooms/{}/state/im.ponies.room_emotes",
-                            urlencoding::encode(&parent_room_id)
-                        ),
-                        None,
-                        None,
-                    )
-                    .await
-                {
-                    parse_emote_content(&parent_content);
+                    Ok(Value::Array(parent_events)) => {
+                        for event in parent_events {
+                            let event_type = event["type"].as_str().unwrap_or("");
+                            if event_type == "im.ponies.emote_rooms"
+                                || event_type == "im.ponies.room_emotes"
+                            {
+                                parse_emote_content(&event["content"], &parent_room_id);
+                            }
+                        }
+                    }
+                    Err(e) => tracing::warn!(
+                        "Failed to fetch state from space {}. Is the bot invited to the space? Error: {}",
+                        parent_room_id,
+                        e
+                    ),
+                    _ => {
+                        tracing::warn!("Space {} returned an invalid state format", parent_room_id)
+                    }
                 }
             }
+        } else {
+            tracing::warn!("Failed to fetch or parse state array for room {}", room_id);
         }
 
         if !emojis.is_empty() {
@@ -883,6 +905,11 @@ impl MatrixClient {
             self.cache
                 .m_custom_emojis
                 .insert(room_id.to_string(), emojis.clone());
+        } else {
+            tracing::warn!(
+                "Finished scanning, but found ZERO emojis for room {}",
+                room_id
+            );
         }
 
         Ok(emojis)
