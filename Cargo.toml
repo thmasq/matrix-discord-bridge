@@ -5,20 +5,23 @@ edition = "2024"
 
 [dependencies]
 # Runtime
-tokio = { version = "1.52.1", features = ["full"] }
+tokio = { version = "1.52.3", features = ["full"] }
 
 # HTTP
 hex = "0.4.3"
 hmac = "0.13.0"
 http-body-util = { version = "0.1.3", features = ["full"] }
 hyper = { version = "1.9.0", features = ["full"] }
+hyper-tls = "0.6.0"
 hyper-util = { version = "0.1.20", features = ["full"] }
+reqwest = { version = "0.13.3", features = ["json", "multipart", "stream"] }
 sha2 = "0.11.0"
+twox-hash = "2.1.2"
+url = "2.5.8"
+urlencoding = "2.1.3"
 
 # Discord
-secrecy = "0.10.3"
 serenity = { version = "0.12.5", features = ["client", "gateway", "model", "cache"] }
-twox-hash = "2.1.2"
 
 # Matrix
 ruma = { version = "0.15.1", features = ["appservice-api", "client-api", "events"] }
@@ -33,26 +36,20 @@ sqlx = { version = "0.8.6", features = ["runtime-tokio-rustls", "sqlite"] }
 
 # Utils
 anyhow = "1.0.102"
+clap = { version = "4.6.1", features = ["derive"] }
 constant_time_eq = "0.5.0"
-once_cell = "1.21.4"
-parking_lot = "0.12.5"
+futures = "0.3.32"
+moka = { version = "0.12.15", features = ["logging", "sync"] }
 regex = "1.12.3"
+shlex = "1.3.0"
 thiserror = "2.0.18"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
-url = "2.5.8"
-urlencoding = "2.1.3"
 uuid = { version = "1.23.1", features = ["v4"] }
 
 # Markdown
-futures = "0.3.32"
 html-escape = "0.2.13"
-hyper-tls = "0.6.0"
 pulldown-cmark = "0.13.3"
-reqwest = { version = "0.13.3", features = ["json", "multipart", "stream"] }
-moka = { version = "0.12.15", features = ["logging", "sync"] }
-clap = { version = "4.6.1", features = ["derive"] }
-shlex = "1.3.0"
 
 [profile.release]
 opt-level = 3
