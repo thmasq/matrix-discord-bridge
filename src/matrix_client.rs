@@ -793,8 +793,8 @@ impl MatrixClient {
     pub async fn fetch_room_emojis(&self, room_id: &str) -> Result<HashMap<String, String>> {
         let mut emojis = HashMap::new();
 
-        let mut parse_emote_state = |state_event: &Value| {
-            if let Some(rooms) = state_event["rooms"].as_object() {
+        let mut parse_emote_content = |content: &Value| {
+            if let Some(rooms) = content["rooms"].as_object() {
                 for (_room_key, room_data) in rooms {
                     if let Some(images) = room_data["images"].as_object() {
                         for (shortcode, image_data) in images {
@@ -807,7 +807,7 @@ impl MatrixClient {
                     }
                 }
             }
-            if let Some(images) = state_event["images"].as_object() {
+            if let Some(images) = content["images"].as_object() {
                 for (shortcode, image_data) in images {
                     if let Some(url) = image_data["url"].as_str() {
                         emojis
@@ -834,7 +834,7 @@ impl MatrixClient {
                 let event_type = event["type"].as_str().unwrap_or("");
 
                 if event_type == "im.ponies.emote_rooms" || event_type == "im.ponies.room_emotes" {
-                    parse_emote_state(event);
+                    parse_emote_content(&event["content"]);
                 } else if event_type == "m.space.parent" {
                     if let Some(parent_room_id) = event["state_key"].as_str() {
                         parent_spaces.push(parent_room_id.to_string());
@@ -843,7 +843,7 @@ impl MatrixClient {
             }
 
             for parent_room_id in parent_spaces {
-                if let Ok(parent_state) = self
+                if let Ok(parent_content) = self
                     .send_request(
                         Method::GET,
                         &format!(
@@ -855,9 +855,9 @@ impl MatrixClient {
                     )
                     .await
                 {
-                    parse_emote_state(&parent_state);
+                    parse_emote_content(&parent_content);
                 }
-                if let Ok(parent_state) = self
+                if let Ok(parent_content) = self
                     .send_request(
                         Method::GET,
                         &format!(
@@ -869,12 +869,17 @@ impl MatrixClient {
                     )
                     .await
                 {
-                    parse_emote_state(&parent_state);
+                    parse_emote_content(&parent_content);
                 }
             }
         }
 
         if !emojis.is_empty() {
+            tracing::info!(
+                "Successfully cached {} Matrix custom emojis for room {}",
+                emojis.len(),
+                room_id
+            );
             self.cache
                 .m_custom_emojis
                 .insert(room_id.to_string(), emojis.clone());
