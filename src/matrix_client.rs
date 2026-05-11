@@ -793,7 +793,7 @@ impl MatrixClient {
     pub async fn fetch_room_emojis(&self, room_id: &str) -> Result<HashMap<String, String>> {
         let mut emojis = HashMap::new();
 
-        let mut parse_emote_content = |content: &Value, source: &str| {
+        let mut parse_emote_content = |content: &Value, _source: &str| {
             if let Some(rooms) = content["rooms"].as_object() {
                 for (_room_key, room_data) in rooms {
                     if let Some(images) = room_data["images"].as_object() {
@@ -835,11 +835,10 @@ impl MatrixClient {
 
                 if event_type == "im.ponies.emote_rooms" || event_type == "im.ponies.room_emotes" {
                     parse_emote_content(&event["content"], "local room");
-                } else if event_type == "m.space.parent" {
-                    if let Some(parent_room_id) = event["state_key"].as_str() {
+                } else if event_type == "m.space.parent"
+                    && let Some(parent_room_id) = event["state_key"].as_str() {
                         parent_spaces.push(parent_room_id.to_string());
                     }
-                }
             }
 
             for parent_room_id in parent_spaces {
@@ -868,7 +867,7 @@ impl MatrixClient {
                         e
                     ),
                     _ => {
-                        tracing::warn!("Space {} returned an invalid state format", parent_room_id)
+                        tracing::warn!("Space {} returned an invalid state format", parent_room_id);
                     }
                 }
             }
@@ -876,7 +875,12 @@ impl MatrixClient {
             tracing::warn!("Failed to fetch or parse state array for room {}", room_id);
         }
 
-        if !emojis.is_empty() {
+        if emojis.is_empty() {
+            tracing::warn!(
+                "Finished scanning, but found ZERO emojis for room {}",
+                room_id
+            );
+        } else {
             tracing::info!(
                 "Successfully cached {} Matrix custom emojis for room {}",
                 emojis.len(),
@@ -885,11 +889,6 @@ impl MatrixClient {
             self.cache
                 .m_custom_emojis
                 .insert(room_id.to_string(), emojis.clone());
-        } else {
-            tracing::warn!(
-                "Finished scanning, but found ZERO emojis for room {}",
-                room_id
-            );
         }
 
         Ok(emojis)

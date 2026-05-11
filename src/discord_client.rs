@@ -1124,7 +1124,7 @@ impl EventHandler for DiscordHandler {
             ReactionType::Unicode(emoji) => emoji.clone(),
             ReactionType::Custom { name, id, .. } => name
                 .as_ref()
-                .map_or_else(|| format!("custom_{id}"), |n| n.clone()),
+                .map_or_else(|| format!("custom_{id}"), std::clone::Clone::clone),
             _ => {
                 tracing::debug!("Unknown reaction type");
                 return;
@@ -1136,19 +1136,20 @@ impl EventHandler for DiscordHandler {
             ReactionType::Custom { animated, id, name } => {
                 let emote_name = name
                     .as_ref()
-                    .map_or_else(|| format!("custom_{id}"), |n| n.clone());
-                let mut mxc = None;
+                    .map_or_else(|| format!("custom_{id}"), std::clone::Clone::clone);
 
-                if let Ok(room_emojis) = self.matrix.get_room_emojis(&room_id).await {
-                    if let Some(url) = room_emojis.get(&emote_name) {
-                        mxc = Some(url.clone());
-                    }
-                }
+                let mut mxc = if let Ok(room_emojis) = self.matrix.get_room_emojis(&room_id).await
+                    && let Some(url) = room_emojis.get(&emote_name)
+                {
+                    Some(url.clone())
+                } else {
+                    None
+                };
 
-                if mxc.is_none() {
-                    if let Some(url) = self.cache.m_emotes.get(&emote_name) {
-                        mxc = Some(url.clone());
-                    }
+                if mxc.is_none()
+                    && let Some(url) = self.cache.m_emotes.get(&emote_name)
+                {
+                    mxc = Some(url);
                 }
 
                 if mxc.is_none() {
@@ -1236,7 +1237,7 @@ impl EventHandler for DiscordHandler {
             ReactionType::Unicode(emoji) => emoji.clone(),
             ReactionType::Custom { name, id, .. } => name
                 .as_ref()
-                .map_or_else(|| format!("custom_{id}"), |n| n.clone()),
+                .map_or_else(|| format!("custom_{id}"), std::clone::Clone::clone),
             _ => return,
         };
 

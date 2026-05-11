@@ -938,41 +938,37 @@ impl AppService {
 
         let mut resolved_discord_emoji = None;
 
+        let id_regex = ID_REGEX.get_or_init(|| regex::Regex::new(r":(\d+)>$").unwrap());
+
         if reaction_key.starts_with("mxc://") {
             for (name, mxc) in &self.cache.m_emotes {
                 if mxc == reaction_key {
-                    if let Some(discord_format) = self.cache.d_emotes.get(&*name) {
-                        let id_regex =
-                            ID_REGEX.get_or_init(|| regex::Regex::new(r":(\d+)>$").unwrap());
-                        if let Some(cap) = id_regex.captures(&discord_format) {
+                    if let Some(discord_format) = self.cache.d_emotes.get(&*name)
+                        && let Some(cap) = id_regex.captures(&discord_format) {
                             resolved_discord_emoji = Some(format!(
                                 "{}%3A{}",
-                                urlencoding::encode(&*name),
+                                urlencoding::encode(&name),
                                 cap.get(1).unwrap().as_str()
                             ));
                         }
-                    }
                     break;
                 }
             }
 
-            if resolved_discord_emoji.is_none() {
-                if let Ok(room_emojis) = self.matrix.get_room_emojis(room_id).await {
-                    for (shortcode, mxc) in room_emojis {
-                        if mxc == reaction_key {
-                            if let Some(discord_format) = self.cache.d_emotes.get(&shortcode) {
-                                let id_regex = ID_REGEX
-                                    .get_or_init(|| regex::Regex::new(r":(\d+)>$").unwrap());
-                                if let Some(cap) = id_regex.captures(&discord_format) {
-                                    resolved_discord_emoji = Some(format!(
-                                        "{}%3A{}",
-                                        urlencoding::encode(&shortcode),
-                                        cap.get(1).unwrap().as_str()
-                                    ));
-                                }
+            if resolved_discord_emoji.is_none()
+                && let Ok(room_emojis) = self.matrix.get_room_emojis(room_id).await
+            {
+                for (shortcode, mxc) in room_emojis {
+                    if mxc == reaction_key {
+                        if let Some(discord_format) = self.cache.d_emotes.get(&shortcode)
+                            && let Some(cap) = id_regex.captures(&discord_format) {
+                                resolved_discord_emoji = Some(format!(
+                                    "{}%3A{}",
+                                    urlencoding::encode(&shortcode),
+                                    cap.get(1).unwrap().as_str()
+                                ));
                             }
-                            break;
-                        }
+                        break;
                     }
                 }
             }
@@ -980,7 +976,6 @@ impl AppService {
             let clean_name = reaction_key.trim_matches(':');
 
             if let Some(discord_format) = self.cache.d_emotes.get(clean_name) {
-                let id_regex = ID_REGEX.get_or_init(|| regex::Regex::new(r":(\d+)>$").unwrap());
                 resolved_discord_emoji = id_regex.captures(&discord_format).map(|cap| {
                     format!(
                         "{}%3A{}",

@@ -190,7 +190,7 @@ impl AdminCommandHandler {
                 UtilAction::Verify { discord_channel_id } => {
                     self.cmd_verify(&discord_channel_id).await
                 }
-                UtilAction::DebugEmojis => self.cmd_debug_emojis().await,
+                UtilAction::DebugEmojis => self.cmd_debug_emojis(),
             },
         };
 
@@ -592,7 +592,7 @@ impl AdminCommandHandler {
         format!("Updated `{setting}` to `{val_bool}` for bridge `{room_id}`")
     }
 
-    async fn cmd_debug_emojis(&self) -> String {
+    fn cmd_debug_emojis(&self) -> String {
         tracing::info!("=== BEGIN EMOJI CACHE DUMP ===");
 
         let d_emotes_count = self.cache.d_emotes.entry_count();
@@ -621,8 +621,7 @@ impl AdminCommandHandler {
         tracing::info!("=== END EMOJI CACHE DUMP ===");
 
         format!(
-            "**Cache Dumped to Console!**\nDiscord Emotes: `{}`\nMatrix Cached Uploads: `{}`\nRoom Emoji Packs: `{}`",
-            d_emotes_count, m_emotes_count, m_custom_count
+            "**Cache Dumped to Console!**\nDiscord Emotes: `{d_emotes_count}`\nMatrix Cached Uploads: `{m_emotes_count}`\nRoom Emoji Packs: `{m_custom_count}`"
         )
     }
 }
