@@ -49,6 +49,22 @@ struct WebhookData {
     token: String,
 }
 
+pub fn ts_to_snowflake(ts_ms: u64) -> u64 {
+    const DISCORD_EPOCH: u64 = 1420070400000;
+    if ts_ms < DISCORD_EPOCH {
+        return 0;
+    }
+    (ts_ms - DISCORD_EPOCH) << 22
+}
+
+pub fn snowflake_to_ts(snowflake: &str) -> u64 {
+    let id = snowflake.parse::<u64>().unwrap_or(0);
+    if id == 0 {
+        return 0;
+    }
+    (id >> 22) + 1420070400000
+}
+
 impl AppService {
     pub fn new(config: Config, matrix: Arc<MatrixClient>, db: Database, cache: Cache) -> Self {
         let discord_http = reqwest::Client::builder()
@@ -1090,7 +1106,7 @@ impl AppService {
         username: &str,
         avatar_url: Option<&str>,
         thread_id: Option<&str>,
-        embed: Option<Value>, // Changed from reply_message_id
+        embed: Option<Value>,
     ) -> crate::error::Result<String> {
         let mut url = format!(
             "https://discord.com/api/v10/webhooks/{}/{}?wait=true",
@@ -1458,6 +1474,55 @@ impl AppService {
         regex.replace_all(html, "").to_string()
     }
 
+    async fn find_discord_message_fallback(
+        &self,
+        channel_id: &str,
+        matrix_ts: u64,
+        original_body: &str,
+    ) -> Option<String> {
+        let snowflake = ts_to_snowflake(matrix_ts);
+
+        let url = format!(
+            "https://discord.com/api/v10/channels/{}/messages?around={}&limit=20",
+            channel_id, snowflake
+        );
+
+        let response = self
+            .discord_http
+            .get(&url)
+            .header(
+                "Authorization",
+                format!("Bot {}", self.config.discord_token),
+            )
+            .send()
+            .await
+            .ok()?;
+
+        if !response.status().is_success() {
+            return None;
+        }
+
+        let messages: Vec<Value> = response.json().await.ok()?;
+
+        let target_text = original_body.trim().to_lowercase();
+        if target_text.is_empty() {
+            return None;
+        }
+
+        for msg in messages {
+            let msg_content = msg["content"].as_str().unwrap_or("").trim().to_lowercase();
+
+            if msg_content == target_text
+                || msg_content.contains(&target_text)
+                || target_text.contains(&msg_content)
+            {
+                return msg["id"].as_str().map(String::from);
+            }
+        }
+
+        None
+    }
+
     /// Extracts reply information from a Matrix event and builds a Discord embed
     /// linking back to the original message.
     async fn build_reply_embed(
@@ -1471,7 +1536,7 @@ impl AppService {
         let in_reply_to = relates_to.get("m.in_reply_to")?;
         let reply_event_id = in_reply_to.get("event_id")?.as_str()?;
 
-        let discord_reply_msg_id = self.cache.m_messages.get(reply_event_id);
+        let mut discord_reply_msg_id = self.cache.m_messages.get(reply_event_id);
 
         let mut guild_id = String::from("@me");
         for (g_id, channels) in &self.cache.d_channels {
@@ -1504,6 +1569,25 @@ impl AppService {
             .and_then(|mxc| self.matrix.mxc_to_http(mxc));
 
         let mut original_body = Self::strip_matrix_reply_fallback(&original_event.body);
+
+        if discord_reply_msg_id.is_none() {
+            tracing::info!("Cache miss for reply! Attempting Discord API fallback search...");
+            if let Some(found_id) = self
+                .find_discord_message_fallback(
+                    channel_id,
+                    original_event.origin_server_ts,
+                    &original_body,
+                )
+                .await
+            {
+                tracing::info!("Fallback search succeeded! Found Discord ID: {}", found_id);
+                self.cache
+                    .insert_message_mapping(reply_event_id.to_string(), found_id.clone());
+                discord_reply_msg_id = Some(found_id);
+            } else {
+                tracing::warn!("Fallback search failed to find matching message.");
+            }
+        }
 
         if original_body.trim().is_empty() {
             original_body = "*[Media]*".to_string();

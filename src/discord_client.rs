@@ -794,11 +794,36 @@ impl EventHandler for DiscordHandler {
             content.push_str(&embed_text);
         }
 
-        // Check if this is a reply
-        let reply_to_event_id = message.referenced_message.as_ref().and_then(|referenced| {
-            // Look up the Matrix event ID for the referenced Discord message
-            self.cache.d_messages.get(&referenced.id.to_string())
-        });
+        let mut reply_to_event_id = None;
+
+        if let Some(referenced) = &message.referenced_message {
+            let ref_id_str = referenced.id.to_string();
+
+            if let Some(matrix_id) = self.cache.d_messages.get(&ref_id_str) {
+                reply_to_event_id = Some(matrix_id);
+            } else {
+                tracing::info!(
+                    "Cache miss for Discord reply. Attempting MSC3030 time-travel search..."
+                );
+
+                if let Ok(Some(matrix_id)) = self
+                    .matrix
+                    .find_matrix_message_fallback(&room_id, &ref_id_str, &referenced.content)
+                    .await
+                {
+                    tracing::info!(
+                        "Time-travel search succeeded! Found Matrix ID: {}",
+                        matrix_id
+                    );
+
+                    self.cache
+                        .insert_message_mapping(matrix_id.clone(), ref_id_str);
+                    reply_to_event_id = Some(matrix_id);
+                } else {
+                    tracing::warn!("Time-travel search failed to find matching Matrix message.");
+                }
+            }
+        }
 
         // Send text message if there's content
         let mut message_event_id = None;
@@ -925,7 +950,28 @@ impl EventHandler for DiscordHandler {
             return;
         }
 
-        let matrix_event_id = self.cache.d_messages.get(&new_msg.id.to_string());
+        let msg_id_str = new_msg.id.to_string();
+
+        let matrix_event_id = if let Some(id) = self.cache.d_messages.get(&msg_id_str) {
+            Some(id)
+        } else {
+            if let Some(bridge) = self.resolve_bridge(&channel_id_str).await {
+                tracing::info!("Cache miss for Discord edit. Attempting fallback...");
+                if let Ok(Some(matrix_id)) = self
+                    .matrix
+                    .find_matrix_message_fallback(&bridge.room_id, &msg_id_str, &new_msg.content)
+                    .await
+                {
+                    self.cache
+                        .insert_message_mapping(matrix_id.clone(), msg_id_str.clone());
+                    Some(matrix_id)
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        };
 
         let Some(matrix_event_id) = matrix_event_id else {
             tracing::debug!(
@@ -1080,7 +1126,39 @@ impl EventHandler for DiscordHandler {
             return;
         }
 
-        let matrix_event_id = self.cache.d_messages.get(&reaction.message_id.to_string());
+        let msg_id_str = reaction.message_id.to_string();
+
+        let matrix_event_id = if let Some(id) = self.cache.d_messages.get(&msg_id_str) {
+            Some(id)
+        } else {
+            if let Some(bridge) = self.resolve_bridge(&channel_id_str).await {
+                tracing::info!(
+                    "Cache miss for Discord reaction. Fetching message content for fallback..."
+                );
+
+                if let Ok(msg) = ctx
+                    .http
+                    .get_message(reaction.channel_id, reaction.message_id)
+                    .await
+                {
+                    if let Ok(Some(matrix_id)) = self
+                        .matrix
+                        .find_matrix_message_fallback(&bridge.room_id, &msg_id_str, &msg.content)
+                        .await
+                    {
+                        self.cache
+                            .insert_message_mapping(matrix_id.clone(), msg_id_str.clone());
+                        Some(matrix_id)
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        };
 
         let Some(matrix_event_id) = matrix_event_id else {
             tracing::debug!(
@@ -1243,7 +1321,59 @@ impl EventHandler for DiscordHandler {
 
         // Find the reaction event ID from cache
         let cache_key = format!("{}:{}:{}", reaction.message_id, user.id, reaction_key);
-        let reaction_event_id = self.cache.d_messages.get(&cache_key);
+        let mut reaction_event_id = self.cache.d_messages.get(&cache_key);
+
+        if reaction_event_id.is_none() {
+            tracing::info!(
+                "Cache miss for reaction removal. Initiating two-step fallback sequence..."
+            );
+
+            let msg_id_str = reaction.message_id.to_string();
+            let mut matrix_msg_id = self.cache.d_messages.get(&msg_id_str);
+
+            if matrix_msg_id.is_none() {
+                if let Ok(msg) = ctx
+                    .http
+                    .get_message(reaction.channel_id, reaction.message_id)
+                    .await
+                {
+                    if let Ok(Some(found_msg_id)) = self
+                        .matrix
+                        .find_matrix_message_fallback(&room_id, &msg_id_str, &msg.content)
+                        .await
+                    {
+                        self.cache
+                            .insert_message_mapping(found_msg_id.clone(), msg_id_str.clone());
+                        matrix_msg_id = Some(found_msg_id);
+                    }
+                }
+            }
+
+            if let Some(parent_msg_id) = matrix_msg_id {
+                let mxid = self.matrix.matrixify_user(&user.id.to_string(), None);
+
+                match self
+                    .matrix
+                    .get_user_reaction_event_id(&room_id, &parent_msg_id, &mxid, &reaction_key)
+                    .await
+                {
+                    Ok(Some(found_reaction_id)) => {
+                        tracing::info!(
+                            "Fallback succeeded! Found reaction event ID: {}",
+                            found_reaction_id
+                        );
+                        self.cache
+                            .d_messages
+                            .insert(cache_key.clone(), found_reaction_id.clone());
+                        reaction_event_id = Some(found_reaction_id);
+                    }
+                    Ok(None) => tracing::debug!("Reaction not found in Matrix relations."),
+                    Err(e) => tracing::warn!("Failed to query Matrix relations: {}", e),
+                }
+            } else {
+                tracing::warn!("Could not resolve parent message for reaction removal fallback.");
+            }
+        }
 
         if let Some(event_id) = reaction_event_id {
             match self.matrix.redact_event(&room_id, &event_id, None).await {

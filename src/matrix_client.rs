@@ -1,4 +1,5 @@
 use crate::{
+    appservice::snowflake_to_ts,
     cache::Cache,
     config::Config,
     db::Database,
@@ -39,6 +40,7 @@ pub struct MatrixEvent {
     pub sender: String,
     pub body: String,
     pub formatted_body: Option<String>,
+    pub origin_server_ts: u64,
 }
 
 #[allow(dead_code)]
@@ -355,6 +357,7 @@ impl MatrixClient {
             discord_channel_id, self.config.server_name
         )
     }
+
     pub async fn resolve_room_alias(&self, alias: &str) -> Result<String> {
         // Check cache first
         if let Some(room_id) = self.cache.m_rooms.get(alias) {
@@ -614,6 +617,7 @@ impl MatrixClient {
 
         Ok(resp["event_id"].as_str().unwrap().to_string())
     }
+
     pub async fn send_media(
         &self,
         room_id: &str,
@@ -1103,6 +1107,7 @@ impl MatrixClient {
             sender: resp["sender"].as_str().unwrap_or("").to_string(),
             body: content["body"].as_str().unwrap_or("").to_string(),
             formatted_body: content["formatted_body"].as_str().map(String::from),
+            origin_server_ts: resp["origin_server_ts"].as_u64().unwrap_or_default(),
         })
     }
 
@@ -1125,5 +1130,170 @@ impl MatrixClient {
 
         uri.host()
             .is_some_and(|host| host == "cdn.discordapp.com" || host == "media.discordapp.net")
+    }
+
+    /// Helper for MSC3030 which uses the /v1/ routing path
+    pub async fn send_v1_request(&self, method: Method, path: &str) -> Result<Value> {
+        let url = format!("{}/_matrix/client/v1{}", self.config.homeserver, path);
+        let uri: Uri = url.parse().unwrap();
+
+        let req = HyperRequest::builder()
+            .method(method)
+            .uri(uri)
+            .header("Authorization", format!("Bearer {}", self.config.as_token))
+            .body(Full::new(Bytes::new()))
+            .unwrap();
+
+        let res = self.http_client.request(req).await?;
+
+        if !res.status().is_success() {
+            return Err(BridgeError::Matrix(format!(
+                "v1 request failed: {}",
+                res.status()
+            )));
+        }
+
+        let body = res.collect().await?.to_bytes();
+        if body.is_empty() {
+            Ok(json!({}))
+        } else {
+            Ok(serde_json::from_slice(&body)?)
+        }
+    }
+
+    /// Uses MSC3030 to jump to the closest Matrix event after the Discord timestamp,
+    /// then searches a wide context window to account for bridge delays.
+    pub async fn find_matrix_message_fallback(
+        &self,
+        room_id: &str,
+        discord_msg_id: &str,
+        original_body: &str,
+    ) -> Result<Option<String>> {
+        let target_text = original_body.trim().to_lowercase();
+        if target_text.is_empty() {
+            return Ok(None);
+        }
+
+        let ts = snowflake_to_ts(discord_msg_id);
+        if ts == 0 {
+            return Ok(None);
+        }
+
+        let ts_resp = self
+            .send_v1_request(
+                Method::GET,
+                &format!(
+                    "/rooms/{}/timestamp_to_event?dir=f&ts={}",
+                    urlencoding::encode(room_id),
+                    ts
+                ),
+            )
+            .await;
+
+        let closest_event_id = match ts_resp {
+            Ok(r) => r["event_id"].as_str().map(String::from),
+            Err(_) => {
+                tracing::warn!("MSC3030 request failed. Is the homeserver up to date?");
+                return Ok(None);
+            }
+        };
+
+        let Some(event_id) = closest_event_id else {
+            return Ok(None);
+        };
+
+        let context_resp = self
+            .send_request(
+                Method::GET,
+                &format!(
+                    "/rooms/{}/context/{}?limit=100",
+                    urlencoding::encode(room_id),
+                    urlencoding::encode(&event_id)
+                ),
+                None,
+                None,
+            )
+            .await?;
+
+        let mut events_to_check = Vec::new();
+        if let Some(before) = context_resp["events_before"].as_array() {
+            // events_before are returned in reverse-chronological order, but it probably doesn't
+            // matter for this fuzzy-matching loop
+            events_to_check.extend(before.iter());
+        }
+        events_to_check.push(&context_resp["event"]);
+        if let Some(after) = context_resp["events_after"].as_array() {
+            events_to_check.extend(after.iter());
+        }
+
+        for event in events_to_check {
+            if event["type"].as_str() != Some("m.room.message") {
+                continue;
+            }
+
+            if let Some(body) = event["content"]["body"].as_str() {
+                let mut clean_body = String::new();
+                let mut in_fallback = true;
+                for line in body.lines() {
+                    if !line.starts_with("> ") && line != ">" {
+                        in_fallback = false;
+                    }
+                    if !in_fallback {
+                        if !clean_body.is_empty() {
+                            clean_body.push('\n');
+                        }
+                        clean_body.push_str(line);
+                    }
+                }
+
+                let body_lower = clean_body.trim().to_lowercase();
+
+                if body_lower == target_text
+                    || (target_text.len() >= 10 && body_lower.contains(&target_text))
+                {
+                    if let Some(ev_id) = event["event_id"].as_str() {
+                        return Ok(Some(ev_id.to_string()));
+                    }
+                }
+            }
+        }
+
+        Ok(None)
+    }
+
+    /// Queries the Matrix relations API to find a specific reaction event ID by a specific user
+    pub async fn get_user_reaction_event_id(
+        &self,
+        room_id: &str,
+        message_event_id: &str,
+        user_mxid: &str,
+        reaction_key: &str,
+    ) -> Result<Option<String>> {
+        let resp = self
+            .send_v1_request(
+                Method::GET,
+                &format!(
+                    "/rooms/{}/relations/{}/m.annotation/m.reaction?limit=100",
+                    urlencoding::encode(room_id),
+                    urlencoding::encode(message_event_id)
+                ),
+            )
+            .await?;
+
+        if let Some(chunk) = resp["chunk"].as_array() {
+            for event in chunk {
+                if event["sender"].as_str() == Some(user_mxid) {
+                    if let Some(relates_to) = event["content"].get("m.relates_to") {
+                        if relates_to["key"].as_str() == Some(reaction_key) {
+                            if let Some(event_id) = event["event_id"].as_str() {
+                                return Ok(Some(event_id.to_string()));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(None)
     }
 }
