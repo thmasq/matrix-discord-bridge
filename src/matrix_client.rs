@@ -836,9 +836,10 @@ impl MatrixClient {
                 if event_type == "im.ponies.emote_rooms" || event_type == "im.ponies.room_emotes" {
                     parse_emote_content(&event["content"], "local room");
                 } else if event_type == "m.space.parent"
-                    && let Some(parent_room_id) = event["state_key"].as_str() {
-                        parent_spaces.push(parent_room_id.to_string());
-                    }
+                    && let Some(parent_room_id) = event["state_key"].as_str()
+                {
+                    parent_spaces.push(parent_room_id.to_string());
+                }
             }
 
             for parent_room_id in parent_spaces {

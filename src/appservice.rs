@@ -30,6 +30,7 @@ const MAX_BODY_SIZE: usize = 20 * 1024 * 1024; // 20 MB
 static MENTION_REGEX: OnceLock<regex::Regex> = OnceLock::new();
 static EMOTE_REGEX: OnceLock<regex::Regex> = OnceLock::new();
 static ID_REGEX: OnceLock<regex::Regex> = OnceLock::new();
+static HTML_REPLY_REGEX: OnceLock<regex::Regex> = OnceLock::new();
 
 pub struct AppService {
     config: Config,
@@ -417,10 +418,77 @@ impl AppService {
 
         let file_body = reqwest::Body::wrap_stream(res.bytes_stream());
 
-        // Get member info for display name and avatar
         let members = self.get_room_members(room_id).await?;
-        let member = members.get(sender);
 
+        let mut reply_embed = None;
+
+        if let Some(relates_to) = content.get("m.relates_to")
+            && let Some(in_reply_to) = relates_to.get("m.in_reply_to")
+            && let Some(reply_event_id) = in_reply_to.get("event_id").and_then(|id| id.as_str())
+        {
+            let discord_reply_msg_id = self.cache.m_messages.get(reply_event_id);
+
+            let mut guild_id = String::from("@me");
+            for (g_id, channels) in &self.cache.d_channels {
+                if channels.contains_key(&channel_id) {
+                    guild_id = g_id.to_string();
+                    break;
+                }
+            }
+
+            if let Ok(original_event) = self.matrix.get_event(room_id, reply_event_id).await {
+                let original_member = members.get(&original_event.sender);
+
+                let original_name = original_member
+                    .and_then(|m| m.display_name.as_ref())
+                    .map_or_else(
+                        || {
+                            original_event
+                                .sender
+                                .split(':')
+                                .next()
+                                .unwrap_or(&original_event.sender)
+                                .to_string()
+                        },
+                        std::clone::Clone::clone,
+                    );
+
+                let original_avatar_url = original_member
+                    .and_then(|m| m.avatar_url.as_ref())
+                    .and_then(|mxc| self.matrix.mxc_to_http(mxc));
+
+                let mut original_body = Self::strip_matrix_reply_fallback(&original_event.body);
+
+                if original_body.trim().is_empty() {
+                    original_body = "*[Media]*".to_string();
+                } else if original_body.len() > 256 {
+                    original_body.truncate(256);
+                    original_body.push('…');
+                }
+
+                let mut author_obj = json!({
+                    "name": format!("Replying to {original_name}")
+                });
+
+                if let Some(avatar) = original_avatar_url {
+                    author_obj["icon_url"] = json!(avatar);
+                }
+
+                if let Some(msg_id) = discord_reply_msg_id {
+                    let jump_url =
+                        format!("https://discord.com/channels/{guild_id}/{channel_id}/{msg_id}");
+                    author_obj["url"] = json!(jump_url);
+                }
+
+                reply_embed = Some(json!({
+                    "author": author_obj,
+                    "description": original_body,
+                    "color": 0x002b_2d31
+                }));
+            }
+        }
+
+        let member = members.get(sender);
         let display_name = member.and_then(|m| m.display_name.as_ref()).map_or_else(
             || sender.split(':').next().unwrap_or(sender),
             std::string::String::as_str,
@@ -462,6 +530,7 @@ impl AppService {
                 avatar_url.as_deref(),
                 filename,
                 file_body,
+                reply_embed,
             )
             .await?;
 
@@ -533,13 +602,87 @@ impl AppService {
         let body = content["body"].as_str().unwrap_or("");
         let formatted_body = content["formatted_body"].as_str();
 
-        let mut processed_body = body.to_string();
+        let mut actual_body = body.to_string();
+        let mut text_to_process = formatted_body.map(std::string::ToString::to_string);
+        let mut reply_embed = None;
 
-        // Handle Matrix mentions -> Discord mentions
-        let text_to_process = formatted_body.unwrap_or(body);
+        let members = self.get_room_members(room_id).await?;
+
+        if let Some(relates_to) = content.get("m.relates_to")
+            && let Some(in_reply_to) = relates_to.get("m.in_reply_to")
+            && let Some(reply_event_id) = in_reply_to.get("event_id").and_then(|id| id.as_str())
+        {
+            let discord_reply_msg_id = self.cache.m_messages.get(reply_event_id);
+
+            let mut guild_id = String::from("@me");
+            for (g_id, channels) in &self.cache.d_channels {
+                if channels.contains_key(channel_id) {
+                    guild_id = g_id.to_string();
+                    break;
+                }
+            }
+
+            actual_body = Self::strip_matrix_reply_fallback(&actual_body);
+            text_to_process = text_to_process.map(|s| Self::strip_matrix_reply_fallback_html(&s));
+
+            if let Ok(original_event) = self.matrix.get_event(room_id, reply_event_id).await {
+                let original_member = members.get(&original_event.sender);
+
+                let original_name = original_member
+                    .and_then(|m| m.display_name.as_ref())
+                    .map_or_else(
+                        || {
+                            original_event
+                                .sender
+                                .split(':')
+                                .next()
+                                .unwrap_or(&original_event.sender)
+                                .to_string()
+                        },
+                        std::clone::Clone::clone,
+                    );
+
+                let original_avatar_url = original_member
+                    .and_then(|m| m.avatar_url.as_ref())
+                    .and_then(|mxc| self.matrix.mxc_to_http(mxc));
+
+                let mut original_body = Self::strip_matrix_reply_fallback(&original_event.body);
+
+                if original_body.trim().is_empty() {
+                    original_body = "*[Media]*".to_string();
+                } else if original_body.len() > 256 {
+                    original_body.truncate(256);
+                    original_body.push('…');
+                }
+
+                let mut author_obj = json!({
+                    "name": format!("Replying to {original_name}")
+                });
+
+                if let Some(avatar) = original_avatar_url {
+                    author_obj["icon_url"] = json!(avatar);
+                }
+
+                if let Some(msg_id) = discord_reply_msg_id {
+                    let jump_url =
+                        format!("https://discord.com/channels/{guild_id}/{channel_id}/{msg_id}");
+                    author_obj["url"] = json!(jump_url);
+                }
+
+                reply_embed = Some(json!({
+                    "author": author_obj,
+                    "description": original_body,
+                    "color": 0x002b_2d31
+                }));
+            }
+        }
+
+        let mut processed_body = actual_body.clone();
+        let process_source = text_to_process.as_deref().unwrap_or(&actual_body);
+
         let mention_regex = MENTION_REGEX
             .get_or_init(|| regex::Regex::new(r"@_discord_(\d+)(?:-\d+)?:[\w.\-]+").unwrap());
-        for cap in mention_regex.captures_iter(text_to_process) {
+        for cap in mention_regex.captures_iter(process_source) {
             if let Some(discord_id) = cap.get(1) {
                 let mention = format!("<@{}>", discord_id.as_str());
                 processed_body = processed_body.replace(&cap[0], &mention);
@@ -563,10 +706,8 @@ impl AppService {
             processed_body.push('…');
         }
 
-        // Get member info for avatar and display name
-        let members = self.get_room_members(room_id).await?;
+        // Get main sender info
         let member = members.get(sender);
-
         let display_name = member.and_then(|m| m.display_name.as_ref()).map_or_else(
             || sender.split(':').next().unwrap_or(sender),
             std::string::String::as_str,
@@ -582,7 +723,6 @@ impl AppService {
             channel_id
         );
 
-        // Get or create webhook
         let webhook = self.get_or_create_webhook(channel_id).await?;
 
         // Send via webhook
@@ -593,10 +733,10 @@ impl AppService {
                 display_name,
                 avatar_url.as_deref(),
                 None,
+                reply_embed,
             )
             .await?;
 
-        // Cache the mapping
         self.cache
             .insert_message_mapping(event_id.to_string(), discord_msg_id);
 
@@ -662,10 +802,77 @@ impl AppService {
 
         let file_body = reqwest::Body::wrap_stream(res.bytes_stream());
 
-        // Get member info
         let members = self.get_room_members(room_id).await?;
-        let member = members.get(sender);
 
+        let mut reply_embed = None;
+
+        if let Some(relates_to) = content.get("m.relates_to")
+            && let Some(in_reply_to) = relates_to.get("m.in_reply_to")
+            && let Some(reply_event_id) = in_reply_to.get("event_id").and_then(|id| id.as_str())
+        {
+            let discord_reply_msg_id = self.cache.m_messages.get(reply_event_id);
+
+            let mut guild_id = String::from("@me");
+            for (g_id, channels) in &self.cache.d_channels {
+                if channels.contains_key(channel_id) {
+                    guild_id = g_id.to_string();
+                    break;
+                }
+            }
+
+            if let Ok(original_event) = self.matrix.get_event(room_id, reply_event_id).await {
+                let original_member = members.get(&original_event.sender);
+
+                let original_name = original_member
+                    .and_then(|m| m.display_name.as_ref())
+                    .map_or_else(
+                        || {
+                            original_event
+                                .sender
+                                .split(':')
+                                .next()
+                                .unwrap_or(&original_event.sender)
+                                .to_string()
+                        },
+                        std::clone::Clone::clone,
+                    );
+
+                let original_avatar_url = original_member
+                    .and_then(|m| m.avatar_url.as_ref())
+                    .and_then(|mxc| self.matrix.mxc_to_http(mxc));
+
+                let mut original_body = Self::strip_matrix_reply_fallback(&original_event.body);
+
+                if original_body.trim().is_empty() {
+                    original_body = "*[Media]*".to_string();
+                } else if original_body.len() > 256 {
+                    original_body.truncate(256);
+                    original_body.push('…');
+                }
+
+                let mut author_obj = json!({
+                    "name": format!("Replying to {original_name}")
+                });
+
+                if let Some(avatar) = original_avatar_url {
+                    author_obj["icon_url"] = json!(avatar);
+                }
+
+                if let Some(msg_id) = discord_reply_msg_id {
+                    let jump_url =
+                        format!("https://discord.com/channels/{guild_id}/{channel_id}/{msg_id}");
+                    author_obj["url"] = json!(jump_url);
+                }
+
+                reply_embed = Some(json!({
+                    "author": author_obj,
+                    "description": original_body,
+                    "color": 0x002b_2d31
+                }));
+            }
+        }
+
+        let member = members.get(sender);
         let display_name = member.and_then(|m| m.display_name.as_ref()).map_or_else(
             || sender.split(':').next().unwrap_or(sender),
             std::string::String::as_str,
@@ -683,7 +890,6 @@ impl AppService {
             channel_id
         );
 
-        // Get webhook
         let webhook = self.get_or_create_webhook(channel_id).await?;
 
         // Upload to Discord and send stream
@@ -695,6 +901,7 @@ impl AppService {
                 avatar_url.as_deref(),
                 &filename,
                 file_body,
+                reply_embed,
             )
             .await?;
 
@@ -944,13 +1151,14 @@ impl AppService {
             for (name, mxc) in &self.cache.m_emotes {
                 if mxc == reaction_key {
                     if let Some(discord_format) = self.cache.d_emotes.get(&*name)
-                        && let Some(cap) = id_regex.captures(&discord_format) {
-                            resolved_discord_emoji = Some(format!(
-                                "{}%3A{}",
-                                urlencoding::encode(&name),
-                                cap.get(1).unwrap().as_str()
-                            ));
-                        }
+                        && let Some(cap) = id_regex.captures(&discord_format)
+                    {
+                        resolved_discord_emoji = Some(format!(
+                            "{}%3A{}",
+                            urlencoding::encode(&name),
+                            cap.get(1).unwrap().as_str()
+                        ));
+                    }
                     break;
                 }
             }
@@ -961,13 +1169,14 @@ impl AppService {
                 for (shortcode, mxc) in room_emojis {
                     if mxc == reaction_key {
                         if let Some(discord_format) = self.cache.d_emotes.get(&shortcode)
-                            && let Some(cap) = id_regex.captures(&discord_format) {
-                                resolved_discord_emoji = Some(format!(
-                                    "{}%3A{}",
-                                    urlencoding::encode(&shortcode),
-                                    cap.get(1).unwrap().as_str()
-                                ));
-                            }
+                            && let Some(cap) = id_regex.captures(&discord_format)
+                        {
+                            resolved_discord_emoji = Some(format!(
+                                "{}%3A{}",
+                                urlencoding::encode(&shortcode),
+                                cap.get(1).unwrap().as_str()
+                            ));
+                        }
                         break;
                     }
                 }
@@ -1203,6 +1412,7 @@ impl AppService {
         username: &str,
         avatar_url: Option<&str>,
         thread_id: Option<&str>,
+        embed: Option<Value>, // Changed from reply_message_id
     ) -> crate::error::Result<String> {
         let mut url = format!(
             "https://discord.com/api/v10/webhooks/{}/{}?wait=true",
@@ -1226,6 +1436,10 @@ impl AppService {
             body["avatar_url"] = json!(avatar);
         }
 
+        if let Some(e) = embed {
+            body["embeds"] = json!([e]);
+        }
+
         let response = self
             .discord_http
             .post(&url)
@@ -1243,12 +1457,8 @@ impl AppService {
             ))));
         }
 
-        let message: Value = response
-            .json()
-            .await
-            .map_err(|e| BridgeError::Matrix(format!("Failed to parse webhook response: {e}")))?;
-
-        Ok(message["id"].as_str().unwrap().to_string())
+        let message: Value = response.json().await.unwrap_or_default();
+        Ok(message["id"].as_str().unwrap_or("").to_string())
     }
 
     async fn send_webhook_with_stream(
@@ -1259,27 +1469,43 @@ impl AppService {
         avatar_url: Option<&str>,
         filename: &str,
         file_body: reqwest::Body,
+        embed: Option<Value>,
     ) -> crate::error::Result<String> {
         let url = format!(
             "https://discord.com/api/v10/webhooks/{}/{}?wait=true",
             webhook.id, webhook.token
         );
 
+        let mut payload = json!({
+            "username": username,
+            "allowed_mentions": {
+                "parse": ["users", "roles"]
+            }
+        });
+
+        if !content.is_empty() {
+            payload["content"] = json!(content);
+        }
+
+        if let Some(avatar) = avatar_url {
+            payload["avatar_url"] = json!(avatar);
+        }
+
+        if let Some(e) = embed {
+            payload["embeds"] = json!([e]);
+        }
+
         let form = reqwest::multipart::Form::new()
-            .text("username", username.to_string())
-            .text("content", content.to_string())
+            .text("payload_json", payload.to_string())
             .part(
                 "file",
                 reqwest::multipart::Part::stream(file_body).file_name(filename.to_string()),
             );
 
-        let mut request = self.discord_http.post(&url).multipart(form);
-
-        if let Some(avatar) = avatar_url {
-            request = request.header("X-Avatar-URL", avatar);
-        }
-
-        let response = request
+        let response = self
+            .discord_http
+            .post(&url)
+            .multipart(form)
             .send()
             .await
             .map_err(|e| BridgeError::Matrix(format!("Failed to send webhook with file: {e}")))?;
@@ -1292,12 +1518,8 @@ impl AppService {
             ))));
         }
 
-        let message: Value = response
-            .json()
-            .await
-            .map_err(|e| BridgeError::Matrix(format!("Failed to parse webhook response: {e}")))?;
-
-        Ok(message["id"].as_str().unwrap().to_string())
+        let message: Value = response.json().await.unwrap_or_default();
+        Ok(message["id"].as_str().unwrap_or("").to_string())
     }
 
     async fn edit_webhook_message(
@@ -1531,5 +1753,30 @@ impl AppService {
         } else {
             "application/octet-stream"
         }
+    }
+
+    fn strip_matrix_reply_fallback(body: &str) -> String {
+        let mut result = String::new();
+        let mut in_fallback = true;
+
+        for line in body.lines() {
+            if !line.starts_with("> ") && line != ">" {
+                in_fallback = false;
+            }
+            if !in_fallback {
+                if !result.is_empty() {
+                    result.push('\n');
+                }
+                result.push_str(line);
+            }
+        }
+
+        result.trim().to_string()
+    }
+
+    fn strip_matrix_reply_fallback_html(html: &str) -> String {
+        let regex = HTML_REPLY_REGEX
+            .get_or_init(|| regex::Regex::new(r"(?s)<mx-reply>.*?</mx-reply>").unwrap());
+        regex.replace_all(html, "").to_string()
     }
 }
