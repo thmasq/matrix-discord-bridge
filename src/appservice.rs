@@ -913,47 +913,88 @@ impl AppService {
             .as_str()
             .ok_or_else(|| BridgeError::Matrix("Reaction missing key".to_string()))?;
 
-        if reaction_key == "❌"
-            || reaction_key == "x"
-            || reaction_key == "X"
-            || reaction_key.eq_ignore_ascii_case(":x:")
-        {
-            if let Ok(target_event) = self.matrix.get_event(room_id, target_event_id).await {
-                if target_event.sender == self.config.full_user_id() {
-                    let mut can_delete = true;
+        let clean_key = reaction_key.trim_end_matches('\u{fe0f}');
+        let shortcode = content
+            .get("shortcode")
+            .and_then(|s| s.as_str())
+            .unwrap_or("");
 
-                    if let Some(reply_id) = target_event.in_reply_to {
-                        if let Ok(original_event) = self.matrix.get_event(room_id, &reply_id).await
-                        {
-                            if original_event.sender != sender {
-                                can_delete = false;
+        if clean_key == "❌"
+            || clean_key == "✖"
+            || clean_key.eq_ignore_ascii_case("x")
+            || shortcode.eq_ignore_ascii_case("x")
+        {
+            match self.matrix.get_event(room_id, target_event_id).await {
+                Ok(target_event) => {
+                    if target_event.sender == self.config.full_user_id() {
+                        let mut can_delete = true;
+
+                        if let Some(reply_id) = target_event.in_reply_to {
+                            match self.matrix.get_event(room_id, &reply_id).await {
+                                Ok(original_event) => {
+                                    if original_event.sender != sender {
+                                        tracing::warn!(
+                                            "User {} tried to delete bot reply meant for {}",
+                                            sender,
+                                            original_event.sender
+                                        );
+                                        can_delete = false;
+                                    }
+                                }
+                                Err(e) => {
+                                    tracing::warn!(
+                                        "Failed to fetch original event {}: {}",
+                                        reply_id,
+                                        e
+                                    );
+                                    can_delete = false;
+                                }
                             }
                         }
-                    }
 
-                    if can_delete {
-                        tracing::info!(
-                            "User {} is deleting bot message {}",
-                            sender,
-                            target_event_id
+                        if can_delete {
+                            tracing::info!(
+                                "User {} is deleting bot message {}",
+                                sender,
+                                target_event_id
+                            );
+                            let _ = self
+                                .matrix
+                                .redact_event(
+                                    room_id,
+                                    target_event_id,
+                                    Some("User deleted bot message via reaction"),
+                                )
+                                .await;
+                            let _ = self
+                                .matrix
+                                .redact_event(room_id, event_id, Some("Clean up deletion reaction"))
+                                .await;
+
+                            return Ok(());
+                        }
+                    } else {
+                        tracing::debug!(
+                            "Sender mismatch! Target message was sent by '{}', but bot thinks its ID is '{}'",
+                            target_event.sender,
+                            self.config.full_user_id()
                         );
-                        let _ = self
-                            .matrix
-                            .redact_event(
-                                room_id,
-                                target_event_id,
-                                Some("User deleted bot message via reaction"),
-                            )
-                            .await;
-                        let _ = self
-                            .matrix
-                            .redact_event(room_id, event_id, Some("Clean up deletion reaction"))
-                            .await;
-
-                        return Ok(());
                     }
                 }
+                Err(e) => {
+                    tracing::error!(
+                        "Failed to fetch target event {} from Matrix: {}",
+                        target_event_id,
+                        e
+                    );
+                }
             }
+        } else {
+            tracing::debug!(
+                "Reaction key '{}' and shortcode '{}' did not match X emote.",
+                reaction_key,
+                shortcode
+            );
         }
 
         // Find the Discord message ID
