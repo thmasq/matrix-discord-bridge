@@ -1,6 +1,6 @@
 use crate::{
     admin_commands::AdminCommandHandler, cache::Cache, config::Config, db::Database,
-    error::BridgeError, matrix_client::MatrixClient,
+    error::BridgeError, matrix_client::MatrixClient, user_commands::UserCommandHandler,
 };
 use hmac::KeyInit;
 use hmac::{Hmac, Mac};
@@ -39,6 +39,7 @@ pub struct AppService {
     cache: Cache,
     discord_http: reqwest::Client,
     admin_handler: AdminCommandHandler,
+    user_handler: UserCommandHandler,
     event_sender: mpsc::Sender<Value>,
     event_receiver: Mutex<Option<mpsc::Receiver<Value>>>,
 }
@@ -80,6 +81,8 @@ impl AppService {
             discord_http.clone(),
         );
 
+        let user_handler = UserCommandHandler::new(matrix.clone(), db.clone(), cache.clone());
+
         let (tx, rx) = mpsc::channel(10000);
 
         Self {
@@ -89,6 +92,7 @@ impl AppService {
             cache,
             discord_http,
             admin_handler,
+            user_handler,
             event_sender: tx,
             event_receiver: Mutex::new(Some(rx)),
         }
@@ -337,16 +341,25 @@ impl AppService {
         }
 
         let msgtype = content["msgtype"].as_str().unwrap_or("m.text");
+        let body = content["body"].as_str().unwrap_or("");
 
-        // Handle admin commands in config room
-        if msgtype == "m.text" {
-            let body = content["body"].as_str().unwrap_or("");
-            if body.starts_with('!') {
-                return self
-                    .admin_handler
-                    .handle_command(room_id, sender, body)
-                    .await;
+        if msgtype == "m.text" && body.starts_with('!') {
+            if let Some(ref config_room) = self.config.config_room_id {
+                if room_id == config_room {
+                    return self
+                        .admin_handler
+                        .handle_command(room_id, sender, body)
+                        .await;
+                }
             }
+        }
+
+        if !self
+            .user_handler
+            .process_event(room_id, sender, body)
+            .await?
+        {
+            return Ok(());
         }
 
         // Check if this is an edit

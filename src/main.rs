@@ -6,6 +6,7 @@ mod db;
 mod discord_client;
 mod error;
 mod matrix_client;
+mod user_commands;
 mod utils;
 
 use crate::{

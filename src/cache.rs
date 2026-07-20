@@ -33,6 +33,9 @@ pub struct Cache {
 
     // Matrix MXC URL -> Cached avatar bytes
     pub m_avatars: MokaCache<String, Vec<u8>>,
+
+    // Matrix mxid -> room_id ("global" for global) -> Preference
+    pub user_prefs: MokaCache<(String, String), Option<crate::db::UserPreference>>,
 }
 
 #[derive(Debug, Clone)]
@@ -52,12 +55,12 @@ impl Default for Cache {
         Self {
             m_rooms: MokaCache::builder()
                 .max_capacity(10_000)
-                .time_to_idle(Duration::from_hours(168)) // 1 week
+                .time_to_idle(Duration::from_hours(168))
                 .build(),
 
             m_members: MokaCache::builder()
                 .max_capacity(1_000)
-                .time_to_idle(Duration::from_hours(1)) // 1 hour idle (members change)
+                .time_to_idle(Duration::from_hours(1))
                 .build(),
 
             m_messages: MokaCache::builder()
@@ -102,7 +105,12 @@ impl Default for Cache {
 
             m_avatars: MokaCache::builder()
                 .weigher(|_key, value: &Vec<u8>| value.len().try_into().unwrap_or(u32::MAX))
-                .max_capacity(50 * 1024 * 1024) // 50 MB max memory limit
+                .max_capacity(50 * 1024 * 1024)
+                .time_to_idle(Duration::from_hours(24))
+                .build(),
+
+            user_prefs: MokaCache::builder()
+                .max_capacity(10_000)
                 .time_to_idle(Duration::from_hours(24))
                 .build(),
         }

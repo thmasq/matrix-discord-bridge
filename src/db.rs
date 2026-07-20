@@ -39,6 +39,15 @@ pub struct PendingInvite {
     pub room_name: Option<String>,
 }
 
+#[derive(Debug, Clone, sqlx::FromRow)]
+#[allow(dead_code)]
+pub struct UserPreference {
+    pub mxid: String,
+    pub room_id: String,
+    pub status: String,
+    pub until_ts: Option<i64>,
+}
+
 impl Database {
     pub async fn new(path: impl AsRef<Path>) -> crate::error::Result<Self> {
         let url = format!("sqlite:{}", path.as_ref().display());
@@ -92,6 +101,18 @@ impl Database {
                 sender TEXT NOT NULL,
                 room_name TEXT
             )",
+        )
+        .execute(&pool)
+        .await?;
+
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS user_preferences (
+            mxid TEXT NOT NULL,
+            room_id TEXT NOT NULL,
+            status TEXT NOT NULL,
+            until_ts INTEGER,
+            PRIMARY KEY (mxid, room_id)
+        )",
         )
         .execute(&pool)
         .await?;
@@ -295,5 +316,65 @@ impl Database {
             .fetch_one(&self.pool)
             .await?;
         Ok(count as u32)
+    }
+
+    pub async fn set_user_preference(
+        &self,
+        mxid: &str,
+        room_id: &str,
+        status: &str,
+        until_ts: Option<i64>,
+    ) -> crate::error::Result<()> {
+        sqlx::query(
+            "INSERT OR REPLACE INTO user_preferences (mxid, room_id, status, until_ts)
+             VALUES (?, ?, ?, ?)",
+        )
+        .bind(mxid)
+        .bind(room_id)
+        .bind(status)
+        .bind(until_ts)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn remove_user_preference(
+        &self,
+        mxid: &str,
+        room_id: &str,
+    ) -> crate::error::Result<()> {
+        sqlx::query("DELETE FROM user_preferences WHERE mxid = ? AND room_id = ?")
+            .bind(mxid)
+            .bind(room_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn get_user_preferences(
+        &self,
+        mxid: &str,
+    ) -> crate::error::Result<Vec<UserPreference>> {
+        let prefs =
+            sqlx::query_as::<_, UserPreference>("SELECT * FROM user_preferences WHERE mxid = ?")
+                .bind(mxid)
+                .fetch_all(&self.pool)
+                .await?;
+        Ok(prefs)
+    }
+
+    pub async fn get_user_preference(
+        &self,
+        mxid: &str,
+        room_id: &str,
+    ) -> crate::error::Result<Option<UserPreference>> {
+        let pref = sqlx::query_as::<_, UserPreference>(
+            "SELECT * FROM user_preferences WHERE mxid = ? AND room_id = ?",
+        )
+        .bind(mxid)
+        .bind(room_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(pref)
     }
 }
