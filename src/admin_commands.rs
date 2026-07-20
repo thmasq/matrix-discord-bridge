@@ -1,15 +1,42 @@
 use crate::{cache::Cache, config::Config, db::Database, matrix_client::MatrixClient};
+use clap::Args;
 use clap::{Parser, Subcommand};
 use ruma::events::room::message::RoomMessageEventContent;
 use serde_json::Value;
-use std::fmt::Write;
 use std::sync::Arc;
 
+const MAX_MESSAGE_SIZE: usize = 30_000;
+const HELP_TEMPLATE: &str = "\
+    {about}
+
+    {usage-heading} {usage}
+
+    {all-args}";
+
+pub enum CommandResponse {
+    Text(String),
+    Yaml(String),
+    Table {
+        headers: Vec<String>,
+        rows: Vec<Vec<String>>,
+        footer: Option<String>,
+    },
+    Terminal(String),
+}
+
 #[derive(Parser, Debug)]
-#[command(name = "!", about = "Bridge Admin Commands")]
+#[command(name = "!", about = "Bridge Admin Commands", help_template = HELP_TEMPLATE)]
 pub struct AdminCli {
     #[command(subcommand)]
     pub command: AdminCommand,
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct Pagination {
+    #[arg(long, default_value_t = 1)]
+    pub page: u32,
+    #[arg(long, default_value_t = 10)]
+    pub limit: u32,
 }
 
 #[derive(Subcommand, Debug)]
@@ -41,7 +68,7 @@ pub enum BridgeAction {
     /// Remove a bridge
     Unlink { matrix_room_id: String },
     /// List all current bridges
-    List,
+    List(Pagination),
     /// Show bridge status for a room
     Status { matrix_room_id: String },
     /// Configure bridge settings
@@ -55,7 +82,7 @@ pub enum BridgeAction {
 #[derive(Subcommand, Debug)]
 pub enum InviteAction {
     /// List pending bot invites
-    List,
+    List(Pagination),
     /// Accept a pending invite (e.g., 1-3 or 4,5)
     Accept { id_or_ranges: String },
     /// Reject/delete invites (e.g., 1-3 or 4,5)
@@ -129,8 +156,10 @@ impl AdminCommandHandler {
 
         // Parse shell-like string with quotes
         let Some(mut args) = shlex::split(body_stripped) else {
-            let response = "Error: Invalid command format. Please check your quotes.".to_string();
-            return self.send_response(room_id, &response).await;
+            let response = CommandResponse::Text(
+                "Error: Invalid command format. Please check your quotes.".to_string(),
+            );
+            return self.send_command_response(room_id, response).await;
         };
 
         if args.is_empty() {
@@ -143,16 +172,9 @@ impl AdminCommandHandler {
         let cli = match AdminCli::try_parse_from(args) {
             Ok(cli) => cli,
             Err(e) => {
-                // Send clap auto-generated help or error messages inside a code block
-                let response = format!(
-                    "<pre><code>{}</code></pre>",
-                    html_escape::encode_text(&e.to_string())
-                );
-                // Bypass MatrixClient processing since it's already pre-formatted HTML
-                let plain_body = e.to_string();
-                let content = RoomMessageEventContent::text_html(plain_body, response);
-                let _ = self.matrix.send_message(room_id, content, None).await;
-                return Ok(());
+                // Return beautiful terminal-like syntax highlighting for clap errors/help
+                let response = CommandResponse::Terminal(e.to_string());
+                return self.send_command_response(room_id, response).await;
             }
         };
 
@@ -166,7 +188,7 @@ impl AdminCommandHandler {
                         .await
                 }
                 BridgeAction::Unlink { matrix_room_id } => self.cmd_unlink(&matrix_room_id).await,
-                BridgeAction::List => self.cmd_list().await,
+                BridgeAction::List(pagination) => self.cmd_list(pagination).await, // Updated
                 BridgeAction::Status { matrix_room_id } => self.cmd_status(&matrix_room_id).await,
                 BridgeAction::Config {
                     matrix_room_id,
@@ -178,7 +200,7 @@ impl AdminCommandHandler {
                 }
             },
             AdminCommand::Invite { action } => match action {
-                InviteAction::List => self.cmd_invite_list().await,
+                InviteAction::List(pagination) => self.cmd_invite_list(pagination).await, // Updated
                 InviteAction::Accept { id_or_ranges } => {
                     self.cmd_invite_accept(&id_or_ranges).await
                 }
@@ -194,192 +216,214 @@ impl AdminCommandHandler {
             },
         };
 
-        self.send_response(room_id, &response).await
+        self.send_command_response(room_id, response).await
     }
 
-    async fn send_response(&self, room_id: &str, text: &str) -> crate::error::Result<()> {
-        let (plain_body, html_body) =
-            MatrixClient::process_for_matrix(text, &std::collections::HashMap::new());
-
-        let content = RoomMessageEventContent::text_html(plain_body, html_body);
-        let _ = self.matrix.send_message(room_id, content, None).await;
+    async fn send_command_response(
+        &self,
+        room_id: &str,
+        response: CommandResponse,
+    ) -> crate::error::Result<()> {
+        let chunks = response.render_chunks();
+        for (plain, html) in chunks {
+            let content = RoomMessageEventContent::text_html(plain, html);
+            let _ = self.matrix.send_message(room_id, content, None).await;
+        }
         Ok(())
     }
 
-    async fn cmd_list(&self) -> String {
-        match self.db.list_all_bridges().await {
+    async fn cmd_list(&self, pagination: Pagination) -> CommandResponse {
+        let limit = pagination.limit.clamp(1, 100);
+        let offset = (pagination.page.saturating_sub(1)) * limit;
+
+        match self.db.list_bridges_paginated(limit, offset).await {
             Ok(bridges) => {
                 if bridges.is_empty() {
-                    "No bridges configured.".to_string()
+                    return CommandResponse::Text("No bridges configured.".to_string());
+                }
+
+                let total = self.db.count_bridges().await.unwrap_or(0);
+                let total_pages = (total as f64 / limit as f64).ceil() as u32;
+
+                let headers = vec![
+                    "Matrix Room".to_string(),
+                    "Discord Channel".to_string(),
+                    "Settings".to_string(),
+                ];
+                let mut rows = Vec::new();
+
+                for bridge in bridges {
+                    rows.push(vec![
+                        bridge.room_id,
+                        bridge.channel_id,
+                        format!("D2M: {} | M2D: {}", bridge.d2m_enabled, bridge.m2d_enabled),
+                    ]);
+                }
+
+                let footer = if total_pages > 1 {
+                    Some(format!(
+                        "Page {} of {} (Total: {}). Use --page <n> to navigate.",
+                        pagination.page, total_pages, total
+                    ))
                 } else {
-                    let mut response = format!("**Active Bridges ({}):**\n\n", bridges.len());
-                    for bridge in bridges {
-                        let _ = write!(
-                            response,
-                            "• Matrix: `{}`\n  Discord: `{}`\n\n",
-                            bridge.room_id, bridge.channel_id
-                        );
-                    }
-                    response
+                    Some(format!("Total Bridges: {}", total))
+                };
+
+                CommandResponse::Table {
+                    headers,
+                    rows,
+                    footer,
                 }
             }
-            Err(e) => format!("Error listing bridges: {e}"),
+            Err(e) => CommandResponse::Text(format!("Error listing bridges: {e}")),
         }
     }
 
-    async fn cmd_link(&self, _sender: &str, room_id: &str, channel_id: &str) -> String {
-        // Validate Matrix room ID format
+    async fn cmd_link(&self, _sender: &str, room_id: &str, channel_id: &str) -> CommandResponse {
         if !room_id.starts_with('!') || !room_id.contains(':') {
-            return "Invalid Matrix room ID format. Should be like: !abc123:matrix.org".to_string();
+            return CommandResponse::Text(
+                "Invalid Matrix room ID format. Should be like: !abc123:matrix.org".to_string(),
+            );
         }
 
-        // Validate Discord channel ID format
         if !channel_id.chars().all(|c| c.is_ascii_digit()) {
-            return "Invalid Discord channel ID format. Should be numeric.".to_string();
+            return CommandResponse::Text(
+                "Invalid Discord channel ID format. Should be numeric.".to_string(),
+            );
         }
 
-        // Check if room is already bridged
         match self.db.get_channel(room_id).await {
-            Ok(Some(_)) => return format!("Matrix room `{room_id}` is already bridged."),
+            Ok(Some(_)) => {
+                return CommandResponse::Text(format!(
+                    "Matrix room `{room_id}` is already bridged."
+                ));
+            }
             Ok(None) => {}
-            Err(e) => return format!("Database error: {e}"),
+            Err(e) => return CommandResponse::Text(format!("Database error: {e}")),
         }
 
-        // Check if Discord channel is already bridged
         match self.db.list_channels().await {
             Ok(channels) => {
                 if channels.contains(&channel_id.to_string()) {
-                    return format!(
+                    return CommandResponse::Text(format!(
                         "Discord channel `{channel_id}` is already bridged to another room."
-                    );
+                    ));
                 }
             }
-            Err(e) => return format!("Database error: {e}"),
+            Err(e) => return CommandResponse::Text(format!("Database error: {e}")),
         }
 
-        // Verify Discord channel access
         match self.verify_discord_channel(channel_id).await {
-            Ok(channel_info) => {
-                // Create the bridge
-                match self.db.add_room(room_id, channel_id).await {
-                    Ok(()) => {
-                        // Update cache
-                        let room_alias = self.matrix.matrixify_room(channel_id);
-                        self.cache.m_rooms.insert(room_alias, room_id.to_string());
+            Ok(channel_info) => match self.db.add_room(room_id, channel_id).await {
+                Ok(()) => {
+                    let room_alias = self.matrix.matrixify_room(channel_id);
+                    self.cache.m_rooms.insert(room_alias, room_id.to_string());
+                    let _ = self.matrix.fetch_room_emojis(room_id, None).await;
 
-                        // Prefetch custom emojis
-                        match self.matrix.fetch_room_emojis(room_id, None).await {
-                            Ok(emojis) => {
-                                tracing::info!(
-                                    "Prefetched {} custom emojis for room {}",
-                                    emojis.len(),
-                                    room_id
-                                );
-                            }
-                            Err(e) => {
-                                tracing::warn!("Failed to prefetch emojis: {}", e);
-                            }
-                        }
-
-                        format!(
-                            "Successfully linked!\n\nMatrix: `{}`\nDiscord: #{} (`{}`)",
-                            room_id, channel_info.name, channel_id
-                        )
-                    }
-                    Err(e) => format!("Failed to create bridge: {e}"),
+                    CommandResponse::Text(format!(
+                        "Successfully linked!\n\nMatrix: `{}`\nDiscord: #{} (`{}`)",
+                        room_id, channel_info.name, channel_id
+                    ))
                 }
-            }
-            Err(e) => format!("Failed to verify Discord channel `{channel_id}`:\n{e}"),
+                Err(e) => CommandResponse::Text(format!("Failed to create bridge: {e}")),
+            },
+            Err(e) => CommandResponse::Text(format!(
+                "Failed to verify Discord channel `{channel_id}`:\n{e}"
+            )),
         }
     }
 
-    async fn cmd_unlink(&self, room_id: &str) -> String {
-        // Check if bridge exists
+    async fn cmd_unlink(&self, room_id: &str) -> CommandResponse {
         match self.db.get_channel(room_id).await {
             Ok(Some(channel_id)) => match self.db.remove_room(room_id).await {
                 Ok(()) => {
                     self.cache.remove_room_data(room_id);
-
-                    format!(
+                    CommandResponse::Text(format!(
                         "Successfully unlinked Matrix room `{room_id}` from Discord channel `{channel_id}`"
-                    )
+                    ))
                 }
-                Err(e) => format!("Failed to remove bridge: {e}"),
+                Err(e) => CommandResponse::Text(format!("Failed to remove bridge: {e}")),
             },
-            Ok(None) => format!("Matrix room `{room_id}` is not bridged."),
-            Err(e) => format!("Database error: {e}"),
+            Ok(None) => CommandResponse::Text(format!("Matrix room `{room_id}` is not bridged.")),
+            Err(e) => CommandResponse::Text(format!("Database error: {e}")),
         }
     }
 
-    async fn cmd_status(&self, room_id: &str) -> String {
+    async fn cmd_status(&self, room_id: &str) -> CommandResponse {
         match self.db.get_channel(room_id).await {
-            Ok(Some(channel_id)) => {
-                // Get Discord channel info
-                match self.verify_discord_channel(&channel_id).await {
-                    Ok(channel_info) => {
-                        // Get emoji count
-                        let emoji_count = self
-                            .matrix
-                            .get_room_emojis(room_id, None)
-                            .await
-                            .map_or(0, |e| e.len());
+            Ok(Some(channel_id)) => match self.verify_discord_channel(&channel_id).await {
+                Ok(channel_info) => {
+                    let emoji_count = self
+                        .matrix
+                        .get_room_emojis(room_id, None)
+                        .await
+                        .map_or(0, |e| e.len());
 
-                        format!(
-                            "**Bridge Status**\n\n\
-                            Matrix Room: `{}`\n\
-                            Discord Channel: #{} (`{}`)\n\
-                            Guild: {}\n\
-                            Custom Emojis Cached: {}\n\
-                            Status: Active",
-                            room_id,
-                            channel_info.name,
-                            channel_id,
-                            channel_info.guild_id.as_deref().unwrap_or("Unknown"),
-                            emoji_count
-                        )
-                    }
-                    Err(e) => {
-                        format!(
-                            "**Bridge Status**\n\n\
-                            Matrix Room: `{room_id}`\n\
-                            Discord Channel: `{channel_id}`\n\
-                            Status: Discord channel not accessible\n\
-                            Error: {e}"
-                        )
-                    }
+                    let yaml = format!(
+                        "matrix_room: \"{}\"\n\
+                                discord_channel:\n  \
+                                  id: \"{}\"\n  \
+                                  name: \"{}\"\n\
+                                guild_id: \"{}\"\n\
+                                custom_emojis_cached: {}\n\
+                                status: \"Active\"",
+                        room_id,
+                        channel_id,
+                        channel_info.name,
+                        channel_info.guild_id.as_deref().unwrap_or("Unknown"),
+                        emoji_count
+                    );
+                    CommandResponse::Yaml(yaml)
                 }
-            }
-            Ok(None) => format!("Matrix room `{room_id}` is not bridged."),
-            Err(e) => format!("Database error: {e}"),
+                Err(e) => {
+                    let yaml = format!(
+                        "matrix_room: \"{}\"\n\
+                                discord_channel: \"{}\"\n\
+                                status: \"Discord channel not accessible\"\n\
+                                error: \"{}\"",
+                        room_id, channel_id, e
+                    );
+                    CommandResponse::Yaml(yaml)
+                }
+            },
+            Ok(None) => CommandResponse::Text(format!("Matrix room `{room_id}` is not bridged.")),
+            Err(e) => CommandResponse::Text(format!("Database error: {e}")),
         }
     }
 
-    async fn cmd_verify(&self, channel_id: &str) -> String {
+    async fn cmd_verify(&self, channel_id: &str) -> CommandResponse {
         if !channel_id.chars().all(|c| c.is_ascii_digit()) {
-            return "Invalid Discord channel ID format. Should be numeric.".to_string();
+            return CommandResponse::Text(
+                "Invalid Discord channel ID format. Should be numeric.".to_string(),
+            );
         }
 
         match self.verify_discord_channel(channel_id).await {
             Ok(channel_info) => {
-                format!(
-                    "**Discord Channel Verified**\n\n\
-                    Channel: #{} (`{}`)\n\
-                    Type: {}\n\
-                    Guild: {}",
-                    channel_info.name,
+                let channel_type_str = if channel_info.channel_type == 0 {
+                    "Text"
+                } else if channel_info.channel_type == 5 {
+                    "News"
+                } else {
+                    "Other"
+                };
+
+                let yaml = format!(
+                    "channel:\n  \
+                          id: \"{}\"\n  \
+                          name: \"{}\"\n\
+                        type: \"{}\"\n\
+                        guild_id: \"{}\"\n\
+                        verified: true",
                     channel_info.id,
-                    if channel_info.channel_type == 0 {
-                        "Text"
-                    } else if channel_info.channel_type == 5 {
-                        "News"
-                    } else {
-                        "Other"
-                    },
+                    channel_info.name,
+                    channel_type_str,
                     channel_info.guild_id.as_deref().unwrap_or("Unknown")
-                )
+                );
+                CommandResponse::Yaml(yaml)
             }
             Err(e) => {
-                format!("Failed to verify channel `{channel_id}`:\n{e}")
+                CommandResponse::Text(format!("Failed to verify channel `{channel_id}`:\n{e}"))
             }
         }
     }
@@ -435,56 +479,78 @@ impl AdminCommandHandler {
         })
     }
 
-    async fn cmd_invite_list(&self) -> String {
-        let invites = match self.db.list_invites().await {
+    async fn cmd_invite_list(&self, pagination: Pagination) -> CommandResponse {
+        let limit = pagination.limit.clamp(1, 100);
+        let offset = (pagination.page.saturating_sub(1)) * limit;
+
+        let invites = match self.db.list_invites_paginated(limit, offset).await {
             Ok(invs) => invs,
-            Err(e) => return format!("Database error: {e}"),
+            Err(e) => return CommandResponse::Text(format!("Database error: {e}")),
         };
 
         if invites.is_empty() {
-            "No pending invites.".to_string()
-        } else {
-            let mut response = "**Pending Invites:**\n\n".to_string();
-            for inv in &invites {
-                let name_part = inv
-                    .room_name
-                    .as_deref()
-                    .map(|n| format!(" `{n}`"))
-                    .unwrap_or_default();
+            return CommandResponse::Text("No pending invites.".to_string());
+        }
 
-                let _ = writeln!(
-                    response,
-                    "- **room**: \"{}\", **id**: \"{}\" (from `{}`)",
-                    name_part, inv.room_id, inv.sender
-                );
-            }
-            response
+        let total = self.db.count_invites().await.unwrap_or(0);
+        let total_pages = (total as f64 / limit as f64).ceil() as u32;
+
+        let headers = vec![
+            "List ID".to_string(),
+            "Matrix Room".to_string(),
+            "Room Name".to_string(),
+            "Sender".to_string(),
+        ];
+
+        let mut rows = Vec::new();
+        for inv in &invites {
+            rows.push(vec![
+                inv.id.to_string(),
+                inv.room_id.clone(),
+                inv.room_name
+                    .clone()
+                    .unwrap_or_else(|| "Unknown".to_string()),
+                inv.sender.clone(),
+            ]);
+        }
+
+        let footer = if total_pages > 1 {
+            Some(format!(
+                "Page {} of {} (Total: {}). Use --page <n> to navigate.",
+                pagination.page, total_pages, total
+            ))
+        } else {
+            Some(format!("Total Invites: {}", total))
+        };
+
+        CommandResponse::Table {
+            headers,
+            rows,
+            footer,
         }
     }
 
-    async fn cmd_invite_accept(&self, id_or_ranges: &str) -> String {
+    async fn cmd_invite_accept(&self, id_or_ranges: &str) -> CommandResponse {
         let invites = match self.db.list_invites().await {
             Ok(invs) => invs,
-            Err(e) => return format!("Database error: {e}"),
+            Err(e) => return CommandResponse::Text(format!("Database error: {e}")),
         };
 
-        let indices = Self::parse_indices(id_or_ranges, invites.len());
-        if indices.is_empty() {
-            return "No valid invites found for the given range.".to_string();
-        }
+        let target_ids = Self::parse_indices(id_or_ranges, 99999999);
 
         let mut success_count = 0;
         let mut err_msgs = Vec::new();
 
-        for &idx in &indices {
-            let invite = &invites[idx - 1];
-            match self.matrix.join_room(&invite.room_id, None).await {
-                Ok(()) => {
-                    let _ = self.db.remove_invite(invite.id).await;
-                    success_count += 1;
-                }
-                Err(e) => {
-                    err_msgs.push(format!("Failed to join {}: {}", invite.room_id, e));
+        for inv in invites {
+            if target_ids.contains(&(inv.id as usize)) {
+                match self.matrix.join_room(&inv.room_id, None).await {
+                    Ok(()) => {
+                        let _ = self.db.remove_invite(inv.id).await;
+                        success_count += 1;
+                    }
+                    Err(e) => {
+                        err_msgs.push(format!("Failed to join {}: {}", inv.room_id, e));
+                    }
                 }
             }
         }
@@ -494,28 +560,40 @@ impl AdminCommandHandler {
             resp.push_str("\nErrors:\n");
             resp.push_str(&err_msgs.join("\n"));
         }
-        resp
+
+        if success_count == 0 {
+            return CommandResponse::Text(
+                "No invites found matching the provided IDs.".to_string(),
+            );
+        }
+
+        CommandResponse::Text(resp)
     }
 
-    async fn cmd_invite_delete(&self, id_or_ranges: &str) -> String {
+    async fn cmd_invite_delete(&self, id_or_ranges: &str) -> CommandResponse {
+        let target_ids = Self::parse_indices(id_or_ranges, 99999999);
+
         let invites = match self.db.list_invites().await {
             Ok(invs) => invs,
-            Err(e) => return format!("Database error: {e}"),
+            Err(e) => return CommandResponse::Text(format!("Database error: {e}")),
         };
 
-        let indices = Self::parse_indices(id_or_ranges, invites.len());
-        if indices.is_empty() {
-            return "No valid invites found for the given range.".to_string();
+        let mut success_count = 0;
+        for inv in invites {
+            if target_ids.contains(&(inv.id as usize)) {
+                let _ = self.matrix.leave_room(&inv.room_id, None).await;
+                let _ = self.db.remove_invite(inv.id).await;
+                success_count += 1;
+            }
         }
 
-        let mut success_count = 0;
-        for &idx in &indices {
-            let invite = &invites[idx - 1];
-            let _ = self.matrix.leave_room(&invite.room_id, None).await;
-            let _ = self.db.remove_invite(invite.id).await;
-            success_count += 1;
+        if success_count == 0 {
+            return CommandResponse::Text(
+                "No invites found matching the provided IDs.".to_string(),
+            );
         }
-        format!("Deleted {success_count} invite(s).")
+
+        CommandResponse::Text(format!("Deleted {success_count} invite(s)."))
     }
 
     fn parse_indices(input: &str, max_val: usize) -> Vec<usize> {
@@ -547,22 +625,25 @@ impl AdminCommandHandler {
         room_id: &str,
         setting: Option<&str>,
         value: Option<&str>,
-    ) -> String {
+    ) -> CommandResponse {
         let bridge = match self.db.get_bridge(room_id).await {
             Ok(Some(b)) => b,
-            Ok(None) => return format!("No bridge found for room `{room_id}`"),
-            Err(e) => return format!("Database error: {e}"),
+            Ok(None) => {
+                return CommandResponse::Text(format!("No bridge found for room `{room_id}`"));
+            }
+            Err(e) => return CommandResponse::Text(format!("Database error: {e}")),
         };
 
         if setting.is_none() || value.is_none() {
-            return format!(
-                "**Configuration for {}**\n\
-                `d2m_enabled`: {}\n\
-                `m2d_enabled`: {}\n\
-                `d2m_mod_deletions`: {}\n\
-                `m2d_mod_deletions`: {}\n\
-                `d2m_typing`: {}\n\
-                `m2d_typing`: {}",
+            let yaml = format!(
+                "bridge_config:\n  \
+                      room_id: \"{}\"\n  \
+                      d2m_enabled: {}\n  \
+                      m2d_enabled: {}\n  \
+                      d2m_mod_deletions: {}\n  \
+                      m2d_mod_deletions: {}\n  \
+                      d2m_typing: {}\n  \
+                      m2d_typing: {}",
                 room_id,
                 bridge.d2m_enabled,
                 bridge.m2d_enabled,
@@ -571,6 +652,7 @@ impl AdminCommandHandler {
                 bridge.d2m_typing,
                 bridge.m2d_typing
             );
+            return CommandResponse::Yaml(yaml);
         }
 
         let setting = setting.unwrap();
@@ -578,7 +660,7 @@ impl AdminCommandHandler {
         let val_bool = match value_str.as_str() {
             "true" | "1" | "yes" | "on" => true,
             "false" | "0" | "no" | "off" => false,
-            _ => return "Value must be true or false".to_string(),
+            _ => return CommandResponse::Text("Value must be true or false".to_string()),
         };
 
         if let Err(e) = self
@@ -586,42 +668,184 @@ impl AdminCommandHandler {
             .update_bridge_config(room_id, setting, val_bool)
             .await
         {
-            return format!("Failed to update config: {e}");
+            return CommandResponse::Text(format!("Failed to update config: {e}"));
         }
 
-        format!("Updated `{setting}` to `{val_bool}` for bridge `{room_id}`")
+        CommandResponse::Text(format!(
+            "Updated `{setting}` to `{val_bool}` for bridge `{room_id}`"
+        ))
     }
 
-    fn cmd_debug_emojis(&self) -> String {
-        tracing::info!("=== BEGIN EMOJI CACHE DUMP ===");
-
+    fn cmd_debug_emojis(&self) -> CommandResponse {
         let d_emotes_count = self.cache.d_emotes.entry_count();
-        tracing::info!("d_emotes (Discord emojis) count: {}", d_emotes_count);
-        for (k, v) in &self.cache.d_emotes {
-            tracing::info!("  {} -> {}", k, v);
-        }
-
         let m_emotes_count = self.cache.m_emotes.entry_count();
-        tracing::info!("m_emotes (Matrix cached uploads) count: {}", m_emotes_count);
-        for (k, v) in &self.cache.m_emotes {
-            tracing::info!("  {} -> {}", k, v);
-        }
-
         let m_custom_count = self.cache.m_custom_emojis.entry_count();
-        tracing::info!(
-            "m_custom_emojis (Room state packs) count: {}",
-            m_custom_count
+
+        let yaml = format!(
+            "cache_stats:\n  \
+    		  discord_emotes: {}\n  \
+    		  matrix_cached_uploads: {}\n  \
+    		  room_emoji_packs: {}\n\
+                note: \"Detailed dump printed to application console log\"",
+            d_emotes_count, m_emotes_count, m_custom_count
         );
-        for (room, emojis) in &self.cache.m_custom_emojis {
-            tracing::info!("  Room: {}", room);
-            for (shortcode, mxc) in emojis {
-                tracing::info!("    {} -> {}", shortcode, mxc);
+
+        CommandResponse::Yaml(yaml)
+    }
+}
+
+impl CommandResponse {
+    pub fn render_chunks(self) -> Vec<(String, String)> {
+        match self {
+            CommandResponse::Text(text) => Self::chunk_text(&text, None),
+            CommandResponse::Yaml(yaml) => Self::chunk_text(&yaml, Some("yaml")),
+            CommandResponse::Terminal(term) => Self::chunk_text(&term, Some("bash")),
+            CommandResponse::Table {
+                headers,
+                rows,
+                footer,
+            } => Self::chunk_table(&headers, &rows, footer.as_deref()),
+        }
+    }
+
+    fn chunk_text(text: &str, lang: Option<&str>) -> Vec<(String, String)> {
+        let mut chunks = Vec::new();
+        let mut current_chunk = String::new();
+
+        for line in text.lines() {
+            if current_chunk.len() + line.len() > MAX_MESSAGE_SIZE {
+                if !current_chunk.is_empty() {
+                    chunks.push(Self::format_text_chunk(&current_chunk, lang));
+                    current_chunk.clear();
+                }
+
+                if line.len() > MAX_MESSAGE_SIZE {
+                    // Force split exceptionally long single lines safely along char boundaries
+                    let mut current = line;
+                    while current.len() > MAX_MESSAGE_SIZE {
+                        let mut split_at = MAX_MESSAGE_SIZE;
+                        while !current.is_char_boundary(split_at) {
+                            split_at -= 1;
+                        }
+                        chunks.push(Self::format_text_chunk(&current[..split_at], lang));
+                        current = &current[split_at..];
+                    }
+                    if !current.is_empty() {
+                        current_chunk.push_str(current);
+                        current_chunk.push('\n');
+                    }
+                } else {
+                    current_chunk.push_str(line);
+                    current_chunk.push('\n');
+                }
+            } else {
+                current_chunk.push_str(line);
+                current_chunk.push('\n');
             }
         }
-        tracing::info!("=== END EMOJI CACHE DUMP ===");
 
-        format!(
-            "**Cache Dumped to Console!**\nDiscord Emotes: `{d_emotes_count}`\nMatrix Cached Uploads: `{m_emotes_count}`\nRoom Emoji Packs: `{m_custom_count}`"
-        )
+        if !current_chunk.is_empty() {
+            chunks.push(Self::format_text_chunk(&current_chunk, lang));
+        }
+
+        chunks
+    }
+
+    fn format_text_chunk(text: &str, lang: Option<&str>) -> (String, String) {
+        let plain = text.trim_end().to_string();
+
+        let html = if let Some(l) = lang {
+            let encoded = html_escape::encode_text(&plain);
+            format!("<pre><code class=\"language-{l}\">{}</code></pre>", encoded)
+        } else {
+            let plain_for_md = plain.replace('\n', "  \n");
+
+            let mut options = pulldown_cmark::Options::empty();
+            options.insert(pulldown_cmark::Options::ENABLE_STRIKETHROUGH);
+            options.insert(pulldown_cmark::Options::ENABLE_TABLES);
+
+            let parser = pulldown_cmark::Parser::new_ext(&plain_for_md, options);
+            let mut html_output = String::new();
+            pulldown_cmark::html::push_html(&mut html_output, parser);
+
+            html_output
+        };
+
+        (plain, html)
+    }
+
+    fn chunk_table(
+        headers: &[String],
+        rows: &[Vec<String>],
+        footer: Option<&str>,
+    ) -> Vec<(String, String)> {
+        if rows.is_empty() {
+            return vec![Self::format_text_chunk("No data to display.", None)];
+        }
+
+        let mut chunks = Vec::new();
+        let mut current_rows = Vec::new();
+        let mut current_size = 0;
+
+        for row in rows {
+            let row_size: usize = row.iter().map(|c| c.len() + 20).sum();
+            if current_size + row_size > MAX_MESSAGE_SIZE && !current_rows.is_empty() {
+                chunks.push(Self::format_table_chunk(headers, &current_rows, None));
+                current_rows.clear();
+                current_size = 0;
+            }
+            current_rows.push(row.clone());
+            current_size += row_size;
+        }
+
+        if !current_rows.is_empty() {
+            chunks.push(Self::format_table_chunk(headers, &current_rows, footer));
+        }
+
+        chunks
+    }
+
+    fn format_table_chunk(
+        headers: &[String],
+        rows: &[Vec<String>],
+        footer: Option<&str>,
+    ) -> (String, String) {
+        let mut plain = String::new();
+        plain.push_str(&headers.join(" | "));
+        plain.push('\n');
+        plain.push_str(
+            &headers
+                .iter()
+                .map(|_| "---")
+                .collect::<Vec<_>>()
+                .join(" | "),
+        );
+        plain.push('\n');
+        for row in rows {
+            plain.push_str(&row.join(" | "));
+            plain.push('\n');
+        }
+
+        let mut html = String::from("<table><thead><tr>");
+        for h in headers {
+            html.push_str(&format!("<th>{}</th>", html_escape::encode_text(h)));
+        }
+        html.push_str("</tr></thead><tbody>");
+        for row in rows {
+            html.push_str("<tr>");
+            for col in row {
+                html.push_str(&format!("<td>{}</td>", html_escape::encode_text(col)));
+            }
+            html.push_str("</tr>");
+        }
+        html.push_str("</tbody></table>");
+
+        if let Some(f) = footer {
+            plain.push_str("\n\n");
+            plain.push_str(f);
+            html.push_str(&format!("<br><em>{}</em>", html_escape::encode_text(f)));
+        }
+
+        (plain, html)
     }
 }

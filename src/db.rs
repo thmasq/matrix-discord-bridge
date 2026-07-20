@@ -136,13 +136,6 @@ impl Database {
         Ok(channels)
     }
 
-    pub async fn list_all_bridges(&self) -> crate::error::Result<Vec<BridgedRoom>> {
-        let bridges = sqlx::query_as::<_, BridgedRoom>("SELECT * FROM bridge")
-            .fetch_all(&self.pool)
-            .await?;
-        Ok(bridges)
-    }
-
     pub async fn remove_room(&self, room_id: &str) -> crate::error::Result<()> {
         sqlx::query("DELETE FROM bridge WHERE room_id = ?")
             .bind(room_id)
@@ -260,5 +253,47 @@ impl Database {
             .await?;
 
         Ok(())
+    }
+
+    pub async fn list_bridges_paginated(
+        &self,
+        limit: u32,
+        offset: u32,
+    ) -> crate::error::Result<Vec<BridgedRoom>> {
+        let bridges = sqlx::query_as::<_, BridgedRoom>("SELECT * FROM bridge LIMIT ? OFFSET ?")
+            .bind(limit)
+            .bind(offset)
+            .fetch_all(&self.pool)
+            .await?;
+        Ok(bridges)
+    }
+
+    pub async fn count_bridges(&self) -> crate::error::Result<u32> {
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM bridge")
+            .fetch_one(&self.pool)
+            .await?;
+        Ok(count as u32)
+    }
+
+    pub async fn list_invites_paginated(
+        &self,
+        limit: u32,
+        offset: u32,
+    ) -> crate::error::Result<Vec<PendingInvite>> {
+        let invites = sqlx::query_as::<_, PendingInvite>(
+            "SELECT id, room_id, sender, room_name FROM invites ORDER BY id ASC LIMIT ? OFFSET ?",
+        )
+        .bind(limit)
+        .bind(offset)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(invites)
+    }
+
+    pub async fn count_invites(&self) -> crate::error::Result<u32> {
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM invites")
+            .fetch_one(&self.pool)
+            .await?;
+        Ok(count as u32)
     }
 }
