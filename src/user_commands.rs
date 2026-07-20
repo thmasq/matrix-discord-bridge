@@ -4,6 +4,23 @@ use ruma::events::room::message::RoomMessageEventContent;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+const USER_HELP_TEMPLATE: &str = "\
+    {about}
+
+    {usage-heading} {usage}
+
+    {all-args}
+
+    Additional Standalone Commands:
+      !nobridge [text]
+              Do not bridge the current message.
+      !nobridgefor <duration> [scope]
+              Disable bridging temporarily. Duration: 15m, 2h, 1d, etc. Scope: 'here' or 'global' (default: here).
+      !neverbridge <scope>
+              Permanently disable bridging. Scope: 'here' or 'global'.
+      !allowbridge <scope>
+              Remove bridging restrictions. Scope: 'here' or 'global'.";
+
 #[derive(Clone, Debug, ValueEnum, PartialEq)]
 pub enum Scope {
     Here,
@@ -11,7 +28,11 @@ pub enum Scope {
 }
 
 #[derive(Parser, Debug)]
-#[command(name = "!bridge", about = "Bridge User Commands")]
+#[command(
+        name = "!bridge",
+        about = "Bridge User Commands",
+        help_template = USER_HELP_TEMPLATE
+    )]
 pub struct BridgeCli {
     #[command(subcommand)]
     pub command: BridgeCommand,
