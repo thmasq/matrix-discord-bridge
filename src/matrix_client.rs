@@ -1335,4 +1335,33 @@ impl MatrixClient {
 
         Ok(None)
     }
+
+    pub async fn get_reactions(&self, room_id: &str, event_id: &str) -> Result<Vec<Value>> {
+        let url = format!(
+            "{}/_matrix/client/v1/rooms/{}/relations/{}/m.annotation/m.reaction",
+            self.config.homeserver,
+            urlencoding::encode(room_id),
+            urlencoding::encode(event_id)
+        );
+
+        let uri: Uri = url
+            .parse()
+            .map_err(|e| BridgeError::Matrix(format!("Invalid URL: {e}")))?;
+        let req = HyperRequest::builder()
+            .method(Method::GET)
+            .uri(uri)
+            .header("Authorization", format!("Bearer {}", self.config.as_token))
+            .body(Full::new(Bytes::new()))
+            .unwrap();
+
+        let res = self.http_client.request(req).await?;
+        let body = res.collect().await?.to_bytes();
+        let json: Value = serde_json::from_slice(&body).unwrap_or_else(|_| json!({}));
+
+        if let Some(chunk) = json.get("chunk").and_then(|c| c.as_array()) {
+            Ok(chunk.clone())
+        } else {
+            Ok(Vec::new())
+        }
+    }
 }

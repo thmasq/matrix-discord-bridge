@@ -733,11 +733,10 @@ impl AppService {
         let room_id = event["room_id"].as_str().unwrap();
         let redacts = event["redacts"].as_str().unwrap();
 
-        // Look up the Discord message ID from cache
-        let discord_msg_id = self.cache.m_messages.get(redacts);
+        let mapped_val = self.cache.m_messages.get(redacts);
 
-        let Some(discord_msg_id) = discord_msg_id else {
-            tracing::debug!("No Discord message found for redaction of {}", redacts);
+        let Some(mapped_val) = mapped_val else {
+            tracing::debug!("No mapping found for redaction of {}", redacts);
             return Ok(());
         };
 
@@ -751,6 +750,84 @@ impl AppService {
             return Ok(());
         }
 
+        if mapped_val.starts_with("reaction|") {
+            let parts: Vec<&str> = mapped_val.splitn(5, '|').collect();
+            if parts.len() == 5 {
+                let discord_msg_id = parts[1];
+                let target_event_id = parts[2];
+                let discord_emoji = parts[3];
+                let reaction_key = parts[4];
+
+                let count_key = format!("reaction_count|{}|{}", target_event_id, reaction_key);
+                let cached_count: Option<u32> = self
+                    .cache
+                    .m_messages
+                    .get(&count_key)
+                    .and_then(|v| v.parse().ok());
+
+                if let Some(count) = cached_count {
+                    if count > 1 {
+                        tracing::debug!(
+                            "Fast path: Decrementing cached reaction count (now {})",
+                            count - 1
+                        );
+                        self.cache
+                            .m_messages
+                            .insert(count_key, (count - 1).to_string());
+                        self.cache.m_messages.invalidate(redacts);
+                        return Ok(());
+                    }
+                }
+
+                tracing::debug!("Slow path: Querying Matrix API for remaining reactions");
+                let mut active = 0;
+                if let Ok(reactions) = self.matrix.get_reactions(room_id, target_event_id).await {
+                    for r in reactions {
+                        let r_event_id = r.get("event_id").and_then(|e| e.as_str()).unwrap_or("");
+
+                        if r_event_id != redacts {
+                            if let Some(content) = r.get("content") {
+                                if let Some(rel) = content.get("m.relates_to") {
+                                    if let Some(key) = rel.get("key").and_then(|k| k.as_str()) {
+                                        if key == reaction_key {
+                                            active += 1;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                self.cache.m_messages.insert(count_key, active.to_string());
+
+                if active == 0 {
+                    tracing::info!(
+                        "Removing reaction {} from Discord message {}",
+                        discord_emoji,
+                        discord_msg_id
+                    );
+                    let url = format!(
+                        "https://discord.com/api/v10/channels/{}/messages/{}/reactions/{}/@me",
+                        bridge.channel_id, discord_msg_id, discord_emoji
+                    );
+                    let _ = self
+                        .discord_http
+                        .delete(&url)
+                        .header(
+                            "Authorization",
+                            format!("Bot {}", self.config.discord_token),
+                        )
+                        .send()
+                        .await;
+                }
+
+                self.cache.m_messages.invalidate(redacts);
+            }
+            return Ok(());
+        }
+
+        let discord_msg_id = mapped_val;
         let sender = event["sender"].as_str().unwrap();
         let is_mod_deletion = match self.matrix.get_event(room_id, redacts).await {
             Ok(original_event) => original_event.sender != sender,
@@ -952,11 +1029,23 @@ impl AppService {
             ))));
         }
 
-        // Cache the reaction mapping for removal
-        let cache_key = format!("{discord_msg_id}:{sender}:{reaction_key}");
+        let count_key = format!("reaction_count|{}|{}", target_event_id, reaction_key);
+        let count: u32 = self
+            .cache
+            .m_messages
+            .get(&count_key)
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0);
         self.cache
             .m_messages
-            .insert(cache_key, event_id.to_string());
+            .insert(count_key, (count + 1).to_string());
+
+        let cache_key =
+            format!("reaction|{discord_msg_id}|{target_event_id}|{discord_emoji}|{reaction_key}");
+
+        self.cache
+            .m_messages
+            .insert(event_id.to_string(), cache_key);
 
         Ok(())
     }
