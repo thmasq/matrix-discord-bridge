@@ -1063,7 +1063,13 @@ impl EventHandler for DiscordHandler {
             .await
         {
             Ok(ev) => !ev.sender.starts_with("@_discord_"),
-            Err(_) => true,
+            Err(_) => {
+                tracing::debug!(
+                    "Failed to fetch event {}, assuming normal D->M deletion",
+                    matrix_event_id
+                );
+                false
+            }
         };
 
         if is_webhook_message && !bridge.d2m_mod_deletions {

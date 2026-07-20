@@ -831,7 +831,13 @@ impl AppService {
         let sender = event["sender"].as_str().unwrap();
         let is_mod_deletion = match self.matrix.get_event(room_id, redacts).await {
             Ok(original_event) => original_event.sender != sender,
-            Err(_) => true,
+            Err(_) => {
+                tracing::debug!(
+                    "Failed to fetch event {}, assuming normal M->D deletion",
+                    redacts
+                );
+                false
+            }
         };
 
         if is_mod_deletion && !bridge.m2d_mod_deletions {

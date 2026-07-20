@@ -87,13 +87,29 @@ impl MatrixClient {
             .unwrap();
 
         let res = self.http_client.request(req).await?;
+        let status = res.status();
         let body = res.collect().await?.to_bytes();
 
-        if body.is_empty() {
-            Ok(json!({}))
+        let json: Value = if body.is_empty() {
+            json!({})
         } else {
-            Ok(serde_json::from_slice(&body)?)
+            serde_json::from_slice(&body)?
+        };
+
+        if !status.is_success() {
+            let errcode = json
+                .get("errcode")
+                .and_then(|v| v.as_str())
+                .unwrap_or("UNKNOWN");
+            let error = json
+                .get("error")
+                .and_then(|v| v.as_str())
+                .unwrap_or("Unknown error");
+            tracing::error!("Matrix API error ({}): {} - {}", status, errcode, error);
+            return Err(BridgeError::Matrix(format!("HTTP {}: {}", status, error)));
         }
+
+        Ok(json)
     }
 
     pub async fn join_room(&self, room_id: &str, mxid: Option<&str>) -> Result<()> {
@@ -1134,7 +1150,7 @@ impl MatrixClient {
                     urlencoding::encode(event_id)
                 ),
                 None,
-                None,
+                Some(&self.config.full_user_id()),
             )
             .await?;
 
