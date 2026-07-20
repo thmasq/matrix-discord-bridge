@@ -107,7 +107,7 @@ impl MatrixClient {
                 .and_then(|v| v.as_str())
                 .unwrap_or("Unknown error");
             tracing::error!("Matrix API error ({}): {} - {}", status, errcode, error);
-            return Err(BridgeError::Matrix(format!("HTTP {}: {}", status, error)));
+            return Err(BridgeError::Matrix(format!("HTTP {status}: {error}")));
         }
 
         Ok(json)
@@ -1008,7 +1008,7 @@ impl MatrixClient {
     ) -> Result<HashMap<String, String>> {
         // Check cache first
         if let Some(emojis) = self.cache.m_custom_emojis.get(room_id) {
-            return Ok(emojis.clone());
+            return Ok(emojis);
         }
 
         // Fetch and cache
@@ -1254,12 +1254,11 @@ impl MatrixClient {
             )
             .await;
 
-        let closest_event_id = match ts_resp {
-            Ok(r) => r["event_id"].as_str().map(String::from),
-            Err(_) => {
-                tracing::warn!("MSC3030 request failed. Is the homeserver up to date?");
-                return Ok(None);
-            }
+        let closest_event_id = if let Ok(r) = ts_resp {
+            r["event_id"].as_str().map(String::from)
+        } else {
+            tracing::warn!("MSC3030 request failed. Is the homeserver up to date?");
+            return Ok(None);
         };
 
         let Some(event_id) = closest_event_id else {
@@ -1312,12 +1311,11 @@ impl MatrixClient {
 
                 let body_lower = clean_body.trim().to_lowercase();
 
-                if body_lower == target_text
-                    || (target_text.len() >= 10 && body_lower.contains(&target_text))
+                if (body_lower == target_text
+                    || (target_text.len() >= 10 && body_lower.contains(&target_text)))
+                    && let Some(ev_id) = event["event_id"].as_str()
                 {
-                    if let Some(ev_id) = event["event_id"].as_str() {
-                        return Ok(Some(ev_id.to_string()));
-                    }
+                    return Ok(Some(ev_id.to_string()));
                 }
             }
         }
@@ -1346,14 +1344,12 @@ impl MatrixClient {
 
         if let Some(chunk) = resp["chunk"].as_array() {
             for event in chunk {
-                if event["sender"].as_str() == Some(user_mxid) {
-                    if let Some(relates_to) = event["content"].get("m.relates_to") {
-                        if relates_to["key"].as_str() == Some(reaction_key) {
-                            if let Some(event_id) = event["event_id"].as_str() {
-                                return Ok(Some(event_id.to_string()));
-                            }
-                        }
-                    }
+                if event["sender"].as_str() == Some(user_mxid)
+                    && let Some(relates_to) = event["content"].get("m.relates_to")
+                    && relates_to["key"].as_str() == Some(reaction_key)
+                    && let Some(event_id) = event["event_id"].as_str()
+                {
+                    return Ok(Some(event_id.to_string()));
                 }
             }
         }
@@ -1383,10 +1379,8 @@ impl MatrixClient {
         let body = res.collect().await?.to_bytes();
         let json: Value = serde_json::from_slice(&body).unwrap_or_else(|_| json!({}));
 
-        if let Some(chunk) = json.get("chunk").and_then(|c| c.as_array()) {
-            Ok(chunk.clone())
-        } else {
-            Ok(Vec::new())
-        }
+        json.get("chunk")
+            .and_then(|c| c.as_array())
+            .map_or_else(|| Ok(Vec::new()), |chunk| Ok(chunk.clone()))
     }
 }

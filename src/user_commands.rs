@@ -21,7 +21,7 @@ const USER_HELP_TEMPLATE: &str = "\
       !allowbridge <scope>
               Remove bridging restrictions. Scope: 'here' or 'global'.";
 
-#[derive(Clone, Debug, ValueEnum, PartialEq)]
+#[derive(Clone, Debug, ValueEnum, PartialEq, Eq)]
 pub enum Scope {
     Here,
     Global,
@@ -196,11 +196,7 @@ impl UserCommandHandler {
                                     let status = match pref.status.as_str() {
                                         "never" => "Never bridge".to_string(),
                                         "until" => {
-                                            if let Some(ts) = pref.until_ts {
-                                                format!("No bridge until timestamp: {}", ts)
-                                            } else {
-                                                "Unknown".to_string()
-                                            }
+                                            pref.until_ts.map_or_else(|| "Unknown".to_string(), |ts| format!("No bridge until timestamp: {ts}"))
                                         },
                                         _ => pref.status.clone(),
                                     };
@@ -213,7 +209,7 @@ impl UserCommandHandler {
                                 }
                             }
                         },
-                        Err(e) => CommandResponse::Text(format!("Error fetching status: {}", e)),
+                        Err(e) => CommandResponse::Text(format!("Error fetching status: {e}")),
                     }
                 }
             }
@@ -247,7 +243,7 @@ impl UserCommandHandler {
                 };
                 CommandResponse::Text(format!("Bridging disabled {msg}."))
             }
-            Err(e) => CommandResponse::Text(format!("Error updating preferences: {}", e)),
+            Err(e) => CommandResponse::Text(format!("Error updating preferences: {e}")),
         }
     }
 
@@ -277,7 +273,7 @@ impl UserCommandHandler {
                     "Removed bridging restrictions {msg}. Messages will now be bridged."
                 ))
             }
-            Err(e) => CommandResponse::Text(format!("Error updating preferences: {}", e)),
+            Err(e) => CommandResponse::Text(format!("Error updating preferences: {e}")),
         }
     }
 
@@ -288,20 +284,17 @@ impl UserCommandHandler {
         duration_str: &str,
         scope: Scope,
     ) -> CommandResponse {
-        let secs = match Self::parse_duration(duration_str) {
-            Some(s) => s,
-            None => {
-                return CommandResponse::Text(
-                    "Invalid time format. Use something like 15m, 2h, 1d, 1M, 1y.".to_string(),
-                );
-            }
+        let Some(secs) = Self::parse_duration(duration_str) else {
+            return CommandResponse::Text(
+                "Invalid time format. Use something like 15m, 2h, 1d, 1M, 1y.".to_string(),
+            );
         };
 
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_secs();
-        let until_ts = (now + secs) as i64;
+        let until_ts = (now + secs).cast_signed();
 
         let target_room = if scope == Scope::Global {
             "global"
@@ -325,12 +318,12 @@ impl UserCommandHandler {
                 };
                 CommandResponse::Text(format!("Bridging disabled {msg} for {duration_str}."))
             }
-            Err(e) => CommandResponse::Text(format!("Error updating preferences: {}", e)),
+            Err(e) => CommandResponse::Text(format!("Error updating preferences: {e}")),
         }
     }
 
     fn parse_duration(s: &str) -> Option<u64> {
-        let s = s.replace(" ", "");
+        let s = s.replace(' ', "");
         if s.is_empty() {
             return None;
         }
@@ -386,15 +379,16 @@ impl UserCommandHandler {
         if let Some(pref) = pref_opt {
             if pref.status == "never" {
                 return false;
-            } else if pref.status == "until" {
-                if let Some(ts) = pref.until_ts {
-                    let now = SystemTime::now()
-                        .duration_since(UNIX_EPOCH)
-                        .unwrap()
-                        .as_secs() as i64;
-                    if now < ts {
-                        return false;
-                    }
+            } else if pref.status == "until"
+                && let Some(ts) = pref.until_ts
+            {
+                let now = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs()
+                    .cast_signed();
+                if now < ts {
+                    return false;
                 }
             }
         }

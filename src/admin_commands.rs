@@ -243,7 +243,7 @@ impl AdminCommandHandler {
                 }
 
                 let total = self.db.count_bridges().await.unwrap_or(0);
-                let total_pages = (total as f64 / limit as f64).ceil() as u32;
+                let total_pages = (f64::from(total) / f64::from(limit)).ceil() as u32;
 
                 let headers = vec![
                     "Matrix Room".to_string(),
@@ -274,7 +274,7 @@ impl AdminCommandHandler {
                         pagination.page, total_pages, total
                     ))
                 } else {
-                    Some(format!("Total Bridges: {}", total))
+                    Some(format!("Total Bridges: {total}"))
                 };
 
                 CommandResponse::Table {
@@ -385,11 +385,10 @@ impl AdminCommandHandler {
                 }
                 Err(e) => {
                     let yaml = format!(
-                        "matrix_room: \"{}\"\n\
-                                discord_channel: \"{}\"\n\
+                        "matrix_room: \"{room_id}\"\n\
+                                discord_channel: \"{channel_id}\"\n\
                                 status: \"Discord channel not accessible\"\n\
-                                error: \"{}\"",
-                        room_id, channel_id, e
+                                error: \"{e}\""
                     );
                     CommandResponse::Yaml(yaml)
                 }
@@ -501,7 +500,7 @@ impl AdminCommandHandler {
         }
 
         let total = self.db.count_invites().await.unwrap_or(0);
-        let total_pages = (total as f64 / limit as f64).ceil() as u32;
+        let total_pages = (f64::from(total) / f64::from(limit)).ceil() as u32;
 
         let headers = vec![
             "List ID".to_string(),
@@ -528,7 +527,7 @@ impl AdminCommandHandler {
                 pagination.page, total_pages, total
             ))
         } else {
-            Some(format!("Total Invites: {}", total))
+            Some(format!("Total Invites: {total}"))
         };
 
         CommandResponse::Table {
@@ -544,7 +543,7 @@ impl AdminCommandHandler {
             Err(e) => return CommandResponse::Text(format!("Database error: {e}")),
         };
 
-        let target_ids = Self::parse_indices(id_or_ranges, 99999999);
+        let target_ids = Self::parse_indices(id_or_ranges, 99_999_999);
 
         let mut success_count = 0;
         let mut err_msgs = Vec::new();
@@ -579,7 +578,7 @@ impl AdminCommandHandler {
     }
 
     async fn cmd_invite_delete(&self, id_or_ranges: &str) -> CommandResponse {
-        let target_ids = Self::parse_indices(id_or_ranges, 99999999);
+        let target_ids = Self::parse_indices(id_or_ranges, 99_999_999);
 
         let invites = match self.db.list_invites().await {
             Ok(invs) => invs,
@@ -691,11 +690,10 @@ impl AdminCommandHandler {
 
         let yaml = format!(
             "cache_stats:\n  \
-    		  discord_emotes: {}\n  \
-    		  matrix_cached_uploads: {}\n  \
-    		  room_emoji_packs: {}\n\
-                note: \"Detailed dump printed to application console log\"",
-            d_emotes_count, m_emotes_count, m_custom_count
+    		  discord_emotes: {d_emotes_count}\n  \
+    		  matrix_cached_uploads: {m_emotes_count}\n  \
+    		  room_emoji_packs: {m_custom_count}\n\
+                note: \"Detailed dump printed to application console log\""
         );
 
         CommandResponse::Yaml(yaml)

@@ -939,23 +939,21 @@ impl EventHandler for DiscordHandler {
 
         let matrix_event_id = if let Some(id) = self.cache.d_messages.get(&msg_id_str) {
             Some(id)
-        } else {
-            if let Some(bridge) = self.resolve_bridge(&channel_id_str).await {
-                tracing::info!("Cache miss for Discord edit. Attempting fallback...");
-                if let Ok(Some(matrix_id)) = self
-                    .matrix
-                    .find_matrix_message_fallback(&bridge.room_id, &msg_id_str, &new_msg.content)
-                    .await
-                {
-                    self.cache
-                        .insert_message_mapping(matrix_id.clone(), msg_id_str.clone());
-                    Some(matrix_id)
-                } else {
-                    None
-                }
+        } else if let Some(bridge) = self.resolve_bridge(&channel_id_str).await {
+            tracing::info!("Cache miss for Discord edit. Attempting fallback...");
+            if let Ok(Some(matrix_id)) = self
+                .matrix
+                .find_matrix_message_fallback(&bridge.room_id, &msg_id_str, &new_msg.content)
+                .await
+            {
+                self.cache
+                    .insert_message_mapping(matrix_id.clone(), msg_id_str.clone());
+                Some(matrix_id)
             } else {
                 None
             }
+        } else {
+            None
         };
 
         let Some(matrix_event_id) = matrix_event_id else {
@@ -1057,19 +1055,18 @@ impl EventHandler for DiscordHandler {
             return;
         }
 
-        let is_webhook_message = match self
+        let is_webhook_message = if let Ok(ev) = self
             .matrix
             .get_event(&bridge.room_id, &matrix_event_id)
             .await
         {
-            Ok(ev) => !ev.sender.starts_with("@_discord_"),
-            Err(_) => {
-                tracing::debug!(
-                    "Failed to fetch event {}, assuming normal D->M deletion",
-                    matrix_event_id
-                );
-                false
-            }
+            !ev.sender.starts_with("@_discord_")
+        } else {
+            tracing::debug!(
+                "Failed to fetch event {}, assuming normal D->M deletion",
+                matrix_event_id
+            );
+            false
         };
 
         if is_webhook_message && !bridge.d2m_mod_deletions {
@@ -1121,34 +1118,32 @@ impl EventHandler for DiscordHandler {
 
         let matrix_event_id = if let Some(id) = self.cache.d_messages.get(&msg_id_str) {
             Some(id)
-        } else {
-            if let Some(bridge) = self.resolve_bridge(&channel_id_str).await {
-                tracing::info!(
-                    "Cache miss for Discord reaction. Fetching message content for fallback..."
-                );
+        } else if let Some(bridge) = self.resolve_bridge(&channel_id_str).await {
+            tracing::info!(
+                "Cache miss for Discord reaction. Fetching message content for fallback..."
+            );
 
-                if let Ok(msg) = ctx
-                    .http
-                    .get_message(reaction.channel_id, reaction.message_id)
+            if let Ok(msg) = ctx
+                .http
+                .get_message(reaction.channel_id, reaction.message_id)
+                .await
+            {
+                if let Ok(Some(matrix_id)) = self
+                    .matrix
+                    .find_matrix_message_fallback(&bridge.room_id, &msg_id_str, &msg.content)
                     .await
                 {
-                    if let Ok(Some(matrix_id)) = self
-                        .matrix
-                        .find_matrix_message_fallback(&bridge.room_id, &msg_id_str, &msg.content)
-                        .await
-                    {
-                        self.cache
-                            .insert_message_mapping(matrix_id.clone(), msg_id_str.clone());
-                        Some(matrix_id)
-                    } else {
-                        None
-                    }
+                    self.cache
+                        .insert_message_mapping(matrix_id.clone(), msg_id_str.clone());
+                    Some(matrix_id)
                 } else {
                     None
                 }
             } else {
                 None
             }
+        } else {
+            None
         };
 
         let Some(matrix_event_id) = matrix_event_id else {
@@ -1334,22 +1329,19 @@ impl EventHandler for DiscordHandler {
             let msg_id_str = reaction.message_id.to_string();
             let mut matrix_msg_id = self.cache.d_messages.get(&msg_id_str);
 
-            if matrix_msg_id.is_none() {
-                if let Ok(msg) = ctx
+            if matrix_msg_id.is_none()
+                && let Ok(msg) = ctx
                     .http
                     .get_message(reaction.channel_id, reaction.message_id)
                     .await
-                {
-                    if let Ok(Some(found_msg_id)) = self
-                        .matrix
-                        .find_matrix_message_fallback(&room_id, &msg_id_str, &msg.content)
-                        .await
-                    {
-                        self.cache
-                            .insert_message_mapping(found_msg_id.clone(), msg_id_str.clone());
-                        matrix_msg_id = Some(found_msg_id);
-                    }
-                }
+                && let Ok(Some(found_msg_id)) = self
+                    .matrix
+                    .find_matrix_message_fallback(&room_id, &msg_id_str, &msg.content)
+                    .await
+            {
+                self.cache
+                    .insert_message_mapping(found_msg_id.clone(), msg_id_str.clone());
+                matrix_msg_id = Some(found_msg_id);
             }
 
             if let Some(parent_msg_id) = matrix_msg_id {

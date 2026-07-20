@@ -1,3 +1,4 @@
+use std::fmt::Write;
 const MAX_MESSAGE_SIZE: usize = 30_000;
 
 pub enum CommandResponse {
@@ -14,10 +15,10 @@ pub enum CommandResponse {
 impl CommandResponse {
     pub fn render_chunks(self) -> Vec<(String, String)> {
         match self {
-            CommandResponse::Text(text) => Self::chunk_text(&text, None),
-            CommandResponse::Yaml(yaml) => Self::chunk_text(&yaml, Some("yaml")),
-            CommandResponse::Terminal(term) => Self::chunk_text(&term, Some("bash")),
-            CommandResponse::Table {
+            Self::Text(text) => Self::chunk_text(&text, None),
+            Self::Yaml(yaml) => Self::chunk_text(&yaml, Some("yaml")),
+            Self::Terminal(term) => Self::chunk_text(&term, Some("bash")),
+            Self::Table {
                 headers,
                 rows,
                 footer,
@@ -70,22 +71,25 @@ impl CommandResponse {
     fn format_text_chunk(text: &str, lang: Option<&str>) -> (String, String) {
         let plain = text.trim_end().to_string();
 
-        let html = if let Some(l) = lang {
-            let encoded = html_escape::encode_text(&plain);
-            format!("<pre><code class=\"language-{l}\">{}</code></pre>", encoded)
-        } else {
-            let plain_for_md = plain.replace('\n', "  \n");
+        let html = lang.map_or_else(
+            || {
+                let plain_for_md = plain.replace('\n', "  \n");
 
-            let mut options = pulldown_cmark::Options::empty();
-            options.insert(pulldown_cmark::Options::ENABLE_STRIKETHROUGH);
-            options.insert(pulldown_cmark::Options::ENABLE_TABLES);
+                let mut options = pulldown_cmark::Options::empty();
+                options.insert(pulldown_cmark::Options::ENABLE_STRIKETHROUGH);
+                options.insert(pulldown_cmark::Options::ENABLE_TABLES);
 
-            let parser = pulldown_cmark::Parser::new_ext(&plain_for_md, options);
-            let mut html_output = String::new();
-            pulldown_cmark::html::push_html(&mut html_output, parser);
+                let parser = pulldown_cmark::Parser::new_ext(&plain_for_md, options);
+                let mut html_output = String::new();
+                pulldown_cmark::html::push_html(&mut html_output, parser);
 
-            html_output
-        };
+                html_output
+            },
+            |l| {
+                let encoded = html_escape::encode_text(&plain);
+                format!("<pre><code class=\"language-{l}\">{encoded}</code></pre>")
+            },
+        );
 
         (plain, html)
     }
@@ -116,7 +120,7 @@ impl CommandResponse {
 
         for (i, header) in headers.iter().enumerate() {
             let width = col_widths[i];
-            text.push_str(&format!("{header:<width$}"));
+            let _ = write!(text, "{header:<width$}");
             if i < headers.len() - 1 {
                 text.push_str(" | ");
             }
@@ -135,7 +139,7 @@ impl CommandResponse {
             for (i, cell) in row.iter().enumerate() {
                 if i < col_widths.len() {
                     let width = col_widths[i];
-                    text.push_str(&format!("{cell:<width$}"));
+                    let _ = write!(text, "{cell:<width$}");
                     if i < col_widths.len() - 1 {
                         text.push_str(" | ");
                     }

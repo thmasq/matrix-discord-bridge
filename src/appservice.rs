@@ -31,6 +31,8 @@ static MENTION_REGEX: OnceLock<regex::Regex> = OnceLock::new();
 static EMOTE_REGEX: OnceLock<regex::Regex> = OnceLock::new();
 static ID_REGEX: OnceLock<regex::Regex> = OnceLock::new();
 static HTML_REPLY_REGEX: OnceLock<regex::Regex> = OnceLock::new();
+static IMG_REGEX: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+static ALT_REGEX: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
 
 pub struct AppService {
     config: Config,
@@ -50,8 +52,8 @@ struct WebhookData {
     token: String,
 }
 
-pub fn ts_to_snowflake(ts_ms: u64) -> u64 {
-    const DISCORD_EPOCH: u64 = 1420070400000;
+pub const fn ts_to_snowflake(ts_ms: u64) -> u64 {
+    const DISCORD_EPOCH: u64 = 1_420_070_400_000;
     if ts_ms < DISCORD_EPOCH {
         return 0;
     }
@@ -63,7 +65,7 @@ pub fn snowflake_to_ts(snowflake: &str) -> u64 {
     if id == 0 {
         return 0;
     }
-    (id >> 22) + 1420070400000
+    (id >> 22) + 1_420_070_400_000
 }
 
 impl AppService {
@@ -343,15 +345,15 @@ impl AppService {
         let msgtype = content["msgtype"].as_str().unwrap_or("m.text");
         let body = content["body"].as_str().unwrap_or("");
 
-        if msgtype == "m.text" && body.starts_with('!') {
-            if let Some(ref config_room) = self.config.config_room_id {
-                if room_id == config_room {
-                    return self
-                        .admin_handler
-                        .handle_command(room_id, sender, body)
-                        .await;
-                }
-            }
+        if msgtype == "m.text"
+            && body.starts_with('!')
+            && let Some(ref config_room) = self.config.config_room_id
+            && room_id == config_room
+        {
+            return self
+                .admin_handler
+                .handle_command(room_id, sender, body)
+                .await;
         }
 
         if !self
@@ -771,25 +773,25 @@ impl AppService {
                 let discord_emoji = parts[3];
                 let reaction_key = parts[4];
 
-                let count_key = format!("reaction_count|{}|{}", target_event_id, reaction_key);
+                let count_key = format!("reaction_count|{target_event_id}|{reaction_key}");
                 let cached_count: Option<u32> = self
                     .cache
                     .m_messages
                     .get(&count_key)
                     .and_then(|v| v.parse().ok());
 
-                if let Some(count) = cached_count {
-                    if count > 1 {
-                        tracing::debug!(
-                            "Fast path: Decrementing cached reaction count (now {})",
-                            count - 1
-                        );
-                        self.cache
-                            .m_messages
-                            .insert(count_key, (count - 1).to_string());
-                        self.cache.m_messages.invalidate(redacts);
-                        return Ok(());
-                    }
+                if let Some(count) = cached_count
+                    && count > 1
+                {
+                    tracing::debug!(
+                        "Fast path: Decrementing cached reaction count (now {})",
+                        count - 1
+                    );
+                    self.cache
+                        .m_messages
+                        .insert(count_key, (count - 1).to_string());
+                    self.cache.m_messages.invalidate(redacts);
+                    return Ok(());
                 }
 
                 tracing::debug!("Slow path: Querying Matrix API for remaining reactions");
@@ -798,16 +800,13 @@ impl AppService {
                     for r in reactions {
                         let r_event_id = r.get("event_id").and_then(|e| e.as_str()).unwrap_or("");
 
-                        if r_event_id != redacts {
-                            if let Some(content) = r.get("content") {
-                                if let Some(rel) = content.get("m.relates_to") {
-                                    if let Some(key) = rel.get("key").and_then(|k| k.as_str()) {
-                                        if key == reaction_key {
-                                            active += 1;
-                                        }
-                                    }
-                                }
-                            }
+                        if r_event_id != redacts
+                            && let Some(content) = r.get("content")
+                            && let Some(rel) = content.get("m.relates_to")
+                            && let Some(key) = rel.get("key").and_then(|k| k.as_str())
+                            && key == reaction_key
+                        {
+                            active += 1;
                         }
                     }
                 }
@@ -842,16 +841,16 @@ impl AppService {
 
         let discord_msg_id = mapped_val;
         let sender = event["sender"].as_str().unwrap();
-        let is_mod_deletion = match self.matrix.get_event(room_id, redacts).await {
-            Ok(original_event) => original_event.sender != sender,
-            Err(_) => {
+        let is_mod_deletion =
+            if let Ok(original_event) = self.matrix.get_event(room_id, redacts).await {
+                original_event.sender != sender
+            } else {
                 tracing::debug!(
                     "Failed to fetch event {}, assuming normal M->D deletion",
                     redacts
                 );
                 false
-            }
-        };
+            };
 
         if is_mod_deletion && !bridge.m2d_mod_deletions {
             tracing::debug!("Ignoring M->D mod deletion");
@@ -1024,16 +1023,15 @@ impl AppService {
         let shortcode_from_event = content.get("shortcode").and_then(|v| v.as_str());
 
         if reaction_key.starts_with("mxc://") {
-            if let Some(sc) = shortcode_from_event {
-                if let Some(discord_format) = self.cache.d_emotes.get(sc) {
-                    if let Some(cap) = id_regex.captures(&discord_format) {
-                        resolved_discord_emoji = Some(format!(
-                            "{}%3A{}",
-                            urlencoding::encode(sc),
-                            cap.get(1).unwrap().as_str()
-                        ));
-                    }
-                }
+            if let Some(sc) = shortcode_from_event
+                && let Some(discord_format) = self.cache.d_emotes.get(sc)
+                && let Some(cap) = id_regex.captures(&discord_format)
+            {
+                resolved_discord_emoji = Some(format!(
+                    "{}%3A{}",
+                    urlencoding::encode(sc),
+                    cap.get(1).unwrap().as_str()
+                ));
             }
 
             if resolved_discord_emoji.is_none() {
@@ -1132,7 +1130,7 @@ impl AppService {
             ))));
         }
 
-        let count_key = format!("reaction_count|{}|{}", target_event_id, reaction_key);
+        let count_key = format!("reaction_count|{target_event_id}|{reaction_key}");
         let count: u32 = self
             .cache
             .m_messages
@@ -1691,8 +1689,7 @@ impl AppService {
         let snowflake = ts_to_snowflake(matrix_ts);
 
         let url = format!(
-            "https://discord.com/api/v10/channels/{}/messages?around={}&limit=20",
-            channel_id, snowflake
+            "https://discord.com/api/v10/channels/{channel_id}/messages?around={snowflake}&limit=20"
         );
 
         let response = self
@@ -1825,28 +1822,30 @@ impl AppService {
     }
 
     fn process_matrix_text_for_discord(&self, body: &str, formatted_body: Option<&str>) -> String {
-        let process_source = if let Some(html) = formatted_body {
-            static SPOILER_REGEX: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
-            let spoiler_regex = SPOILER_REGEX.get_or_init(|| {
-                regex::Regex::new(r#"(?s)<span[^>]*data-mx-spoiler[^>]*>(.*?)</span>"#).unwrap()
-            });
-            let mut preprocessed = spoiler_regex
-                .replace_all(html, "\u{E000}$1\u{E001}")
-                .to_string();
+        let process_source = formatted_body.map_or_else(
+            || body.to_string(),
+            |html| {
+                static SPOILER_REGEX: std::sync::OnceLock<regex::Regex> =
+                    std::sync::OnceLock::new();
+                let spoiler_regex = SPOILER_REGEX.get_or_init(|| {
+                    regex::Regex::new(r"(?s)<span[^>]*data-mx-spoiler[^>]*>(.*?)</span>").unwrap()
+                });
+                let mut preprocessed = spoiler_regex
+                    .replace_all(html, "\u{E000}$1\u{E001}")
+                    .to_string();
 
-            static IMG_REGEX: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
-            let img_regex =
-                IMG_REGEX.get_or_init(|| regex::Regex::new(r#"(?s)<img[^>]+>"#).unwrap());
+                let img_regex =
+                    IMG_REGEX.get_or_init(|| regex::Regex::new(r"(?s)<img[^>]+>").unwrap());
 
-            static ALT_REGEX: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
-            let alt_regex =
-                ALT_REGEX.get_or_init(|| regex::Regex::new(r#"alt="([^"]+)""#).unwrap());
+                let alt_regex =
+                    ALT_REGEX.get_or_init(|| regex::Regex::new(r#"alt="([^"]+)""#).unwrap());
 
-            preprocessed = img_regex
-                .replace_all(&preprocessed, |caps: &regex::Captures| {
-                    let img_tag = caps[0].to_string();
-                    if img_tag.contains("data-mx-emoticon") {
-                        if let Some(alt_caps) = alt_regex.captures(&img_tag) {
+                preprocessed = img_regex
+                    .replace_all(&preprocessed, |caps: &regex::Captures| {
+                        let img_tag = caps[0].to_string();
+                        if img_tag.contains("data-mx-emoticon")
+                            && let Some(alt_caps) = alt_regex.captures(&img_tag)
+                        {
                             let mut alt = alt_caps[1].to_string();
 
                             if !alt.starts_with(':') {
@@ -1858,18 +1857,16 @@ impl AppService {
 
                             return alt;
                         }
-                    }
-                    img_tag
-                })
-                .to_string();
+                        img_tag
+                    })
+                    .to_string();
 
-            let mut md = html2md::parse_html(&preprocessed);
+                let mut md = html2md::parse_html(&preprocessed);
 
-            md = md.replace('\u{E000}', "||").replace('\u{E001}', "||");
-            md
-        } else {
-            body.to_string()
-        };
+                md = md.replace(['\u{E000}', '\u{E001}'], "||");
+                md
+            },
+        );
 
         let mention_regex = MENTION_REGEX.get_or_init(|| {
                 regex::Regex::new(r"(?s)(```.*?```|`.*?`)|\[[^\]]*\]\(https://matrix\.to/#/@_discord_(\d+)(?:-\d+)?:[\w.\-]+\)|@_discord_(\d+)(?:-\d+)?:[\w.\-]+").unwrap()
@@ -1877,13 +1874,14 @@ impl AppService {
 
         let mentions_replaced =
             mention_regex.replace_all(&process_source, |caps: &regex::Captures| {
-                if let Some(code) = caps.get(1) {
-                    code.as_str().to_string()
-                } else if let Some(id) = caps.get(2).or_else(|| caps.get(3)) {
-                    format!("<@{}>", id.as_str())
-                } else {
-                    caps[0].to_string()
-                }
+                caps.get(1).map_or_else(
+                    || {
+                        caps.get(2)
+                            .or_else(|| caps.get(3))
+                            .map_or_else(|| caps[0].to_string(), |id| format!("<@{}>", id.as_str()))
+                    },
+                    |code| code.as_str().to_string(),
+                )
             });
 
         let emote_regex = EMOTE_REGEX
@@ -1891,17 +1889,21 @@ impl AppService {
 
         let mut processed_body = emote_regex
             .replace_all(&mentions_replaced, |caps: &regex::Captures| {
-                if let Some(code) = caps.get(1) {
-                    code.as_str().to_string()
-                } else if let Some(emote_name) = caps.get(2) {
-                    let name = emote_name.as_str();
-                    self.cache
-                        .d_emotes
-                        .get(name)
-                        .unwrap_or_else(|| caps[0].to_string())
-                } else {
-                    caps[0].to_string()
-                }
+                caps.get(1).map_or_else(
+                    || {
+                        caps.get(2).map_or_else(
+                            || caps[0].to_string(),
+                            |emote_name| {
+                                let name = emote_name.as_str();
+                                self.cache
+                                    .d_emotes
+                                    .get(name)
+                                    .unwrap_or_else(|| caps[0].to_string())
+                            },
+                        )
+                    },
+                    |code| code.as_str().to_string(),
+                )
             })
             .into_owned();
 
