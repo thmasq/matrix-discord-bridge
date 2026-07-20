@@ -1236,9 +1236,20 @@ impl EventHandler for DiscordHandler {
             _ => return,
         };
 
+        let shortcode = match &reaction.emoji {
+            ReactionType::Custom { .. } => Some(reaction_name.as_str()),
+            _ => None,
+        };
+
         match self
             .matrix
-            .send_reaction(&room_id, &matrix_event_id, &matrix_reaction_key, &mxid)
+            .send_reaction(
+                &room_id,
+                &matrix_event_id,
+                &matrix_reaction_key,
+                &mxid,
+                shortcode,
+            )
             .await
         {
             Ok(reaction_event_id) => {

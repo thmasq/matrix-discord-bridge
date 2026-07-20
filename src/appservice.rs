@@ -841,19 +841,35 @@ impl AppService {
 
         let id_regex = ID_REGEX.get_or_init(|| regex::Regex::new(r":(\d+)>$").unwrap());
 
+        let shortcode_from_event = content.get("shortcode").and_then(|v| v.as_str());
+
         if reaction_key.starts_with("mxc://") {
-            for (name, mxc) in &self.cache.m_emotes {
-                if mxc == reaction_key {
-                    if let Some(discord_format) = self.cache.d_emotes.get(&*name)
-                        && let Some(cap) = id_regex.captures(&discord_format)
-                    {
+            if let Some(sc) = shortcode_from_event {
+                if let Some(discord_format) = self.cache.d_emotes.get(sc) {
+                    if let Some(cap) = id_regex.captures(&discord_format) {
                         resolved_discord_emoji = Some(format!(
                             "{}%3A{}",
-                            urlencoding::encode(&name),
+                            urlencoding::encode(sc),
                             cap.get(1).unwrap().as_str()
                         ));
                     }
-                    break;
+                }
+            }
+
+            if resolved_discord_emoji.is_none() {
+                for (name, mxc) in &self.cache.m_emotes {
+                    if mxc == reaction_key {
+                        if let Some(discord_format) = self.cache.d_emotes.get(&*name)
+                            && let Some(cap) = id_regex.captures(&discord_format)
+                        {
+                            resolved_discord_emoji = Some(format!(
+                                "{}%3A{}",
+                                urlencoding::encode(&name),
+                                cap.get(1).unwrap().as_str()
+                            ));
+                        }
+                        break;
+                    }
                 }
             }
 

@@ -592,14 +592,22 @@ impl MatrixClient {
         event_id: &str,
         reaction_key: &str,
         mxid: &str,
+        shortcode: Option<&str>,
     ) -> Result<String> {
-        let content = json!({
+        let mut content = json!({
             "m.relates_to": {
                 "rel_type": "m.annotation",
                 "event_id": event_id,
                 "key": reaction_key
             }
         });
+
+        if let Some(sc) = shortcode {
+            content
+                .as_object_mut()
+                .unwrap()
+                .insert("shortcode".to_string(), json!(sc));
+        }
 
         let txn_id = uuid::Uuid::new_v4();
         let resp = self
@@ -826,7 +834,7 @@ impl MatrixClient {
             }
         };
 
-        let state_resp = self
+        let mut state_resp = self
             .send_request(
                 Method::GET,
                 &format!("/rooms/{}/state", urlencoding::encode(room_id)),
@@ -834,6 +842,17 @@ impl MatrixClient {
                 mxid,
             )
             .await;
+
+        if state_resp.as_ref().map_or(true, |v| !v.is_array()) && mxid.is_some() {
+            state_resp = self
+                .send_request(
+                    Method::GET,
+                    &format!("/rooms/{}/state", urlencoding::encode(room_id)),
+                    None,
+                    None,
+                )
+                .await;
+        }
 
         if let Ok(Value::Array(state_events)) = state_resp {
             let mut parent_spaces = Vec::new();
@@ -851,15 +870,27 @@ impl MatrixClient {
             }
 
             for parent_room_id in parent_spaces {
-                match self
+                let mut parent_state_resp = self
                     .send_request(
                         Method::GET,
                         &format!("/rooms/{}/state", urlencoding::encode(&parent_room_id)),
                         None,
                         mxid,
                     )
-                    .await
-                {
+                    .await;
+
+                if parent_state_resp.as_ref().map_or(true, |v| !v.is_array()) && mxid.is_some() {
+                    parent_state_resp = self
+                        .send_request(
+                            Method::GET,
+                            &format!("/rooms/{}/state", urlencoding::encode(&parent_room_id)),
+                            None,
+                            None,
+                        )
+                        .await;
+                }
+
+                match parent_state_resp {
                     Ok(Value::Array(parent_events)) => {
                         for event in parent_events {
                             let event_type = event["type"].as_str().unwrap_or("");
