@@ -1,17 +1,17 @@
 [package]
 name = "matrix-discord-bridge"
-version = "0.1.0"
+version = "1.0.0"
 edition = "2024"
 
 [dependencies]
 # Runtime
-tokio = { version = "1.53.0", features = ["full"] }
+tokio = { version = "1.53.1", features = ["full"] }
 
 # HTTP
 hex = "0.4.3"
 hmac = "0.13.0"
 http-body-util = { version = "0.1.4", features = ["full"] }
-hyper = { version = "1.10.1", features = ["full"] }
+hyper = { version = "1.11.0", features = ["full"] }
 hyper-tls = "0.6.0"
 hyper-util = { version = "0.1.20", features = ["full"] }
 reqwest = { version = "0.13.4", features = ["json", "multipart", "stream"] }
@@ -29,14 +29,14 @@ ruma-client = { version = "0.19.0", features = ["hyper-rustls", "client-api"] }
 
 # Serialization
 serde = { version = "1.0.229", features = ["derive"] }
-serde_json = "1.0.150"
+serde_json = "1.0.151"
 
 # Persistence
 sqlx = { version = "0.9.0", features = ["runtime-tokio", "tls-rustls-ring-webpki", "sqlite"] }
 
 # Utils
 anyhow = "1.0.104"
-clap = { version = "4.6.2", features = ["derive"] }
+clap = { version = "4.6.3", features = ["derive"] }
 constant_time_eq = "0.5.0"
 futures = "0.3.33"
 moka = { version = "0.12.15", features = ["logging", "sync"] }
