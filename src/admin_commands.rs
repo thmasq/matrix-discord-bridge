@@ -73,8 +73,19 @@ pub enum BridgeAction {
     Status { matrix_room_id: String },
     /// Configure bridge settings
     Config {
+        /// The Matrix room ID of the bridge to configure
         matrix_room_id: String,
+
+        /// The setting to modify
+        #[arg(value_parser = [
+                "d2m_enabled", "m2d_enabled",
+                "d2m_mod_deletions", "m2d_mod_deletions",
+                "d2m_typing", "m2d_typing"
+            ])]
         setting: Option<String>,
+
+        /// The boolean value to apply
+        #[arg(value_parser = ["true", "false", "1", "0", "yes", "no", "on", "off"])]
         value: Option<String>,
     },
 }
@@ -256,7 +267,15 @@ impl AdminCommandHandler {
                     rows.push(vec![
                         bridge.room_id,
                         bridge.channel_id,
-                        format!("D2M: {} | M2D: {}", bridge.d2m_enabled, bridge.m2d_enabled),
+                        format!(
+                            "D2M: {} (ModDel: {}, TypingStatus: {}) | M2D: {} (ModDel: {}, TypingStatus: {})",
+                            bridge.d2m_enabled,
+                            bridge.d2m_mod_deletions,
+                            bridge.d2m_typing,
+                            bridge.m2d_enabled,
+                            bridge.m2d_mod_deletions,
+                            bridge.m2d_typing
+                        ),
                     ]);
                 }
 
