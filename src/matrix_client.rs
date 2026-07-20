@@ -41,6 +41,7 @@ pub struct MatrixEvent {
     pub body: String,
     pub formatted_body: Option<String>,
     pub origin_server_ts: u64,
+    pub in_reply_to: Option<String>,
 }
 
 #[allow(dead_code)]
@@ -1157,12 +1158,20 @@ impl MatrixClient {
         let empty = serde_json::json!({});
         let content = resp.get("content").unwrap_or(&empty);
 
+        let in_reply_to = content
+            .get("m.relates_to")
+            .and_then(|r| r.get("m.in_reply_to"))
+            .and_then(|r| r.get("event_id"))
+            .and_then(|id| id.as_str())
+            .map(String::from);
+
         Ok(MatrixEvent {
             event_id: resp["event_id"].as_str().unwrap_or("").to_string(),
             sender: resp["sender"].as_str().unwrap_or("").to_string(),
             body: content["body"].as_str().unwrap_or("").to_string(),
             formatted_body: content["formatted_body"].as_str().map(String::from),
             origin_server_ts: resp["origin_server_ts"].as_u64().unwrap_or_default(),
+            in_reply_to,
         })
     }
 

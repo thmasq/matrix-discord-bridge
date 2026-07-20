@@ -913,6 +913,49 @@ impl AppService {
             .as_str()
             .ok_or_else(|| BridgeError::Matrix("Reaction missing key".to_string()))?;
 
+        if reaction_key == "❌"
+            || reaction_key == "x"
+            || reaction_key == "X"
+            || reaction_key.eq_ignore_ascii_case(":x:")
+        {
+            if let Ok(target_event) = self.matrix.get_event(room_id, target_event_id).await {
+                if target_event.sender == self.config.full_user_id() {
+                    let mut can_delete = true;
+
+                    if let Some(reply_id) = target_event.in_reply_to {
+                        if let Ok(original_event) = self.matrix.get_event(room_id, &reply_id).await
+                        {
+                            if original_event.sender != sender {
+                                can_delete = false;
+                            }
+                        }
+                    }
+
+                    if can_delete {
+                        tracing::info!(
+                            "User {} is deleting bot message {}",
+                            sender,
+                            target_event_id
+                        );
+                        let _ = self
+                            .matrix
+                            .redact_event(
+                                room_id,
+                                target_event_id,
+                                Some("User deleted bot message via reaction"),
+                            )
+                            .await;
+                        let _ = self
+                            .matrix
+                            .redact_event(room_id, event_id, Some("Clean up deletion reaction"))
+                            .await;
+
+                        return Ok(());
+                    }
+                }
+            }
+        }
+
         // Find the Discord message ID
         let discord_msg_id = self.cache.m_messages.get(target_event_id);
 
