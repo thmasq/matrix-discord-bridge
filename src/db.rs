@@ -1,5 +1,9 @@
-use sqlx::{SqlitePool, sqlite::SqlitePoolOptions};
+use sqlx::{
+    SqlitePool,
+    sqlite::{SqliteConnectOptions, SqlitePoolOptions},
+};
 use std::path::Path;
+use std::str::FromStr;
 
 #[derive(Debug, Clone)]
 pub struct Database {
@@ -38,9 +42,15 @@ pub struct PendingInvite {
 impl Database {
     pub async fn new(path: impl AsRef<Path>) -> crate::error::Result<Self> {
         let url = format!("sqlite:{}", path.as_ref().display());
+
+        let options = SqliteConnectOptions::from_str(&url)?
+            .pragma("journal_mode", "WAL")
+            .pragma("synchronous", "NORMAL")
+            .pragma("foreign_keys", "ON");
+
         let pool = SqlitePoolOptions::new()
             .max_connections(5)
-            .connect(&url)
+            .connect_with(options)
             .await?;
 
         // Create tables
@@ -55,6 +65,12 @@ impl Database {
                 d2m_typing BOOLEAN NOT NULL DEFAULT 1,
                 m2d_typing BOOLEAN NOT NULL DEFAULT 1
             )",
+        )
+        .execute(&pool)
+        .await?;
+
+        sqlx::query(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_bridge_channel_id ON bridge(channel_id)",
         )
         .execute(&pool)
         .await?;
@@ -136,7 +152,7 @@ impl Database {
     }
 
     pub async fn add_user(&self, mxid: &str) -> crate::error::Result<()> {
-        sqlx::query("INSERT INTO users (mxid) VALUES (?)")
+        sqlx::query("INSERT OR IGNORE INTO users (mxid) VALUES (?)")
             .bind(mxid)
             .execute(&self.pool)
             .await?;
@@ -223,25 +239,26 @@ impl Database {
         setting: &str,
         value: bool,
     ) -> crate::error::Result<()> {
-        let valid = [
-            "d2m_enabled",
-            "m2d_enabled",
-            "d2m_mod_deletions",
-            "m2d_mod_deletions",
-            "d2m_typing",
-            "m2d_typing",
-        ];
-        if !valid.contains(&setting) {
-            return Err(crate::error::BridgeError::Database(sqlx::Error::Protocol(
-                "Invalid setting".into(),
-            )));
-        }
-        let query = format!("UPDATE bridge SET {setting} = ? WHERE room_id = ?");
-        sqlx::query(&query)
+        let query = match setting {
+            "d2m_enabled" => "UPDATE bridge SET d2m_enabled = ? WHERE room_id = ?",
+            "m2d_enabled" => "UPDATE bridge SET m2d_enabled = ? WHERE room_id = ?",
+            "d2m_mod_deletions" => "UPDATE bridge SET d2m_mod_deletions = ? WHERE room_id = ?",
+            "m2d_mod_deletions" => "UPDATE bridge SET m2d_mod_deletions = ? WHERE room_id = ?",
+            "d2m_typing" => "UPDATE bridge SET d2m_typing = ? WHERE room_id = ?",
+            "m2d_typing" => "UPDATE bridge SET m2d_typing = ? WHERE room_id = ?",
+            _ => {
+                return Err(crate::error::BridgeError::Database(sqlx::Error::Protocol(
+                    "Invalid setting".into(),
+                )));
+            }
+        };
+
+        sqlx::query(query)
             .bind(value)
             .bind(room_id)
             .execute(&self.pool)
             .await?;
+
         Ok(())
     }
 }

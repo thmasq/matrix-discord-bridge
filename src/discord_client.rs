@@ -750,25 +750,8 @@ impl EventHandler for DiscordHandler {
 
         let channel_id_str = message.channel_id.to_string();
 
-        // Check if channel is bridged
-        let channels = match self.db.list_channels().await {
-            Ok(ch) => ch,
-            Err(e) => {
-                tracing::error!("Failed to list channels: {}", e);
-                return;
-            }
-        };
-
-        if !channels.contains(&channel_id_str) {
-            return;
-        }
-
         // Resolve Matrix room ID
         let Some(bridge) = self.resolve_bridge(&channel_id_str).await else {
-            tracing::warn!(
-                "Could not resolve Matrix room for Discord channel {}",
-                channel_id_str
-            );
             return;
         };
         if !bridge.d2m_enabled {
