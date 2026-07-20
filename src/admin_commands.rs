@@ -1,3 +1,4 @@
+use crate::utils::CommandResponse;
 use crate::{cache::Cache, config::Config, db::Database, matrix_client::MatrixClient};
 use clap::Args;
 use clap::{Parser, Subcommand};
@@ -5,24 +6,12 @@ use ruma::events::room::message::RoomMessageEventContent;
 use serde_json::Value;
 use std::sync::Arc;
 
-const MAX_MESSAGE_SIZE: usize = 30_000;
 const HELP_TEMPLATE: &str = "\
     {about}
 
     {usage-heading} {usage}
 
     {all-args}";
-
-pub enum CommandResponse {
-    Text(String),
-    Yaml(String),
-    Table {
-        headers: Vec<String>,
-        rows: Vec<Vec<String>>,
-        footer: Option<String>,
-    },
-    Terminal(String),
-}
 
 #[derive(Parser, Debug)]
 #[command(name = "!", about = "Bridge Admin Commands", help_template = HELP_TEMPLATE)]
@@ -710,161 +699,5 @@ impl AdminCommandHandler {
         );
 
         CommandResponse::Yaml(yaml)
-    }
-}
-
-impl CommandResponse {
-    pub fn render_chunks(self) -> Vec<(String, String)> {
-        match self {
-            CommandResponse::Text(text) => Self::chunk_text(&text, None),
-            CommandResponse::Yaml(yaml) => Self::chunk_text(&yaml, Some("yaml")),
-            CommandResponse::Terminal(term) => Self::chunk_text(&term, Some("bash")),
-            CommandResponse::Table {
-                headers,
-                rows,
-                footer,
-            } => Self::chunk_table(&headers, &rows, footer.as_deref()),
-        }
-    }
-
-    fn chunk_text(text: &str, lang: Option<&str>) -> Vec<(String, String)> {
-        let mut chunks = Vec::new();
-        let mut current_chunk = String::new();
-
-        for line in text.lines() {
-            if current_chunk.len() + line.len() > MAX_MESSAGE_SIZE {
-                if !current_chunk.is_empty() {
-                    chunks.push(Self::format_text_chunk(&current_chunk, lang));
-                    current_chunk.clear();
-                }
-
-                if line.len() > MAX_MESSAGE_SIZE {
-                    // Force split exceptionally long single lines safely along char boundaries
-                    let mut current = line;
-                    while current.len() > MAX_MESSAGE_SIZE {
-                        let mut split_at = MAX_MESSAGE_SIZE;
-                        while !current.is_char_boundary(split_at) {
-                            split_at -= 1;
-                        }
-                        chunks.push(Self::format_text_chunk(&current[..split_at], lang));
-                        current = &current[split_at..];
-                    }
-                    if !current.is_empty() {
-                        current_chunk.push_str(current);
-                        current_chunk.push('\n');
-                    }
-                } else {
-                    current_chunk.push_str(line);
-                    current_chunk.push('\n');
-                }
-            } else {
-                current_chunk.push_str(line);
-                current_chunk.push('\n');
-            }
-        }
-
-        if !current_chunk.is_empty() {
-            chunks.push(Self::format_text_chunk(&current_chunk, lang));
-        }
-
-        chunks
-    }
-
-    fn format_text_chunk(text: &str, lang: Option<&str>) -> (String, String) {
-        let plain = text.trim_end().to_string();
-
-        let html = if let Some(l) = lang {
-            let encoded = html_escape::encode_text(&plain);
-            format!("<pre><code class=\"language-{l}\">{}</code></pre>", encoded)
-        } else {
-            let plain_for_md = plain.replace('\n', "  \n");
-
-            let mut options = pulldown_cmark::Options::empty();
-            options.insert(pulldown_cmark::Options::ENABLE_STRIKETHROUGH);
-            options.insert(pulldown_cmark::Options::ENABLE_TABLES);
-
-            let parser = pulldown_cmark::Parser::new_ext(&plain_for_md, options);
-            let mut html_output = String::new();
-            pulldown_cmark::html::push_html(&mut html_output, parser);
-
-            html_output
-        };
-
-        (plain, html)
-    }
-
-    fn chunk_table(
-        headers: &[String],
-        rows: &[Vec<String>],
-        footer: Option<&str>,
-    ) -> Vec<(String, String)> {
-        if rows.is_empty() {
-            return vec![Self::format_text_chunk("No data to display.", None)];
-        }
-
-        let mut chunks = Vec::new();
-        let mut current_rows = Vec::new();
-        let mut current_size = 0;
-
-        for row in rows {
-            let row_size: usize = row.iter().map(|c| c.len() + 20).sum();
-            if current_size + row_size > MAX_MESSAGE_SIZE && !current_rows.is_empty() {
-                chunks.push(Self::format_table_chunk(headers, &current_rows, None));
-                current_rows.clear();
-                current_size = 0;
-            }
-            current_rows.push(row.clone());
-            current_size += row_size;
-        }
-
-        if !current_rows.is_empty() {
-            chunks.push(Self::format_table_chunk(headers, &current_rows, footer));
-        }
-
-        chunks
-    }
-
-    fn format_table_chunk(
-        headers: &[String],
-        rows: &[Vec<String>],
-        footer: Option<&str>,
-    ) -> (String, String) {
-        let mut plain = String::new();
-        plain.push_str(&headers.join(" | "));
-        plain.push('\n');
-        plain.push_str(
-            &headers
-                .iter()
-                .map(|_| "---")
-                .collect::<Vec<_>>()
-                .join(" | "),
-        );
-        plain.push('\n');
-        for row in rows {
-            plain.push_str(&row.join(" | "));
-            plain.push('\n');
-        }
-
-        let mut html = String::from("<table><thead><tr>");
-        for h in headers {
-            html.push_str(&format!("<th>{}</th>", html_escape::encode_text(h)));
-        }
-        html.push_str("</tr></thead><tbody>");
-        for row in rows {
-            html.push_str("<tr>");
-            for col in row {
-                html.push_str(&format!("<td>{}</td>", html_escape::encode_text(col)));
-            }
-            html.push_str("</tr>");
-        }
-        html.push_str("</tbody></table>");
-
-        if let Some(f) = footer {
-            plain.push_str("\n\n");
-            plain.push_str(f);
-            html.push_str(&format!("<br><em>{}</em>", html_escape::encode_text(f)));
-        }
-
-        (plain, html)
     }
 }
