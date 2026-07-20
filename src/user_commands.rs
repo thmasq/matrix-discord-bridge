@@ -73,7 +73,7 @@ impl UserCommandHandler {
             || body_trimmed.starts_with("!allowbridge")
             || body_trimmed.starts_with("!nobridgefor")
         {
-            let Some(mut args) = shlex::split(body_trimmed) else {
+            let Some(args) = shlex::split(body_trimmed) else {
                 let _ = self
                     .send_response(
                         room_id,
@@ -82,8 +82,6 @@ impl UserCommandHandler {
                     .await;
                 return Ok(false);
             };
-
-            args.insert(0, "bot".to_string());
 
             if body_trimmed.starts_with("!bridge") {
                 match BridgeCli::try_parse_from(args) {
