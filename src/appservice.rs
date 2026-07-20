@@ -469,7 +469,7 @@ impl AppService {
         self.cache.m_custom_emojis.remove(room_id);
 
         // Fetch fresh emoji data
-        match self.matrix.fetch_room_emojis(room_id).await {
+        match self.matrix.fetch_room_emojis(room_id, None).await {
             Ok(emojis) => {
                 tracing::info!("Cached {} custom emojis for room {}", emojis.len(), room_id);
             }
@@ -858,7 +858,7 @@ impl AppService {
             }
 
             if resolved_discord_emoji.is_none()
-                && let Ok(room_emojis) = self.matrix.get_room_emojis(room_id).await
+                && let Ok(room_emojis) = self.matrix.get_room_emojis(room_id, None).await
             {
                 for (shortcode, mxc) in room_emojis {
                     if mxc == reaction_key {

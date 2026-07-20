@@ -469,11 +469,12 @@ impl DiscordHandler {
         content: &str,
         discord_emotes: &HashMap<String, String>,
         reply_to_event_id: Option<String>,
+        mxid: Option<&str>,
     ) -> RoomMessageEventContent {
         // Get Matrix room's custom emojis
         let room_emojis = self
             .matrix
-            .get_room_emojis(room_id)
+            .get_room_emojis(room_id, mxid)
             .await
             .unwrap_or_default();
 
@@ -817,6 +818,7 @@ impl EventHandler for DiscordHandler {
                     &content,
                     &emotes,
                     reply_to_event_id,
+                    Some(&mxid),
                 )
                 .await;
 
@@ -1199,7 +1201,8 @@ impl EventHandler for DiscordHandler {
                     .as_ref()
                     .map_or_else(|| format!("custom_{id}"), std::clone::Clone::clone);
 
-                let mut mxc = if let Ok(room_emojis) = self.matrix.get_room_emojis(&room_id).await
+                let mut mxc = if let Ok(room_emojis) =
+                    self.matrix.get_room_emojis(&room_id, Some(&mxid)).await
                     && let Some(url) = room_emojis.get(&emote_name)
                 {
                     Some(url.clone())

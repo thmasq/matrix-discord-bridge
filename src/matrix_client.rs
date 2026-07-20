@@ -481,7 +481,7 @@ impl MatrixClient {
                                         events.push(Event::Text(part[last_end..mat.start()].to_string().into()));
                                     }
                                     let emote_html = format!(
-                                        r#"<img alt=":{emote_name}:" title=":{emote_name}:" height="32" src="{mxc_url}" data-mx-emoticon />"#
+                                        r#"<img alt="{emote_name}" title="{emote_name}" height="32" src="{mxc_url}" data-mx-emoticon />"#
                                     );
                                     events.push(Event::Html(emote_html.into()));
                                     last_end = mat.end();
@@ -794,7 +794,11 @@ impl MatrixClient {
 
     /// Fetch custom emoji (image packs) for a room
     /// Supports MSC2545 (`im.ponies.emote_rooms`) used by Nheko, Cinny, etc.
-    pub async fn fetch_room_emojis(&self, room_id: &str) -> Result<HashMap<String, String>> {
+    pub async fn fetch_room_emojis(
+        &self,
+        room_id: &str,
+        mxid: Option<&str>,
+    ) -> Result<HashMap<String, String>> {
         let mut emojis = HashMap::new();
 
         let mut parse_emote_content = |content: &Value, _source: &str| {
@@ -827,7 +831,7 @@ impl MatrixClient {
                 Method::GET,
                 &format!("/rooms/{}/state", urlencoding::encode(room_id)),
                 None,
-                None,
+                mxid,
             )
             .await;
 
@@ -852,7 +856,7 @@ impl MatrixClient {
                         Method::GET,
                         &format!("/rooms/{}/state", urlencoding::encode(&parent_room_id)),
                         None,
-                        None,
+                        mxid,
                     )
                     .await
                 {
@@ -949,14 +953,18 @@ impl MatrixClient {
     }
 
     /// Get cached custom emojis for a room, or fetch if not cached
-    pub async fn get_room_emojis(&self, room_id: &str) -> Result<HashMap<String, String>> {
+    pub async fn get_room_emojis(
+        &self,
+        room_id: &str,
+        mxid: Option<&str>,
+    ) -> Result<HashMap<String, String>> {
         // Check cache first
         if let Some(emojis) = self.cache.m_custom_emojis.get(room_id) {
-            return Ok(emojis);
+            return Ok(emojis.clone());
         }
 
         // Fetch and cache
-        self.fetch_room_emojis(room_id).await
+        self.fetch_room_emojis(room_id, mxid).await
     }
 
     pub async fn send_sticker(

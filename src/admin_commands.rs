@@ -268,7 +268,7 @@ impl AdminCommandHandler {
                         self.cache.m_rooms.insert(room_alias, room_id.to_string());
 
                         // Prefetch custom emojis
-                        match self.matrix.fetch_room_emojis(room_id).await {
+                        match self.matrix.fetch_room_emojis(room_id, None).await {
                             Ok(emojis) => {
                                 tracing::info!(
                                     "Prefetched {} custom emojis for room {}",
@@ -320,7 +320,7 @@ impl AdminCommandHandler {
                         // Get emoji count
                         let emoji_count = self
                             .matrix
-                            .get_room_emojis(room_id)
+                            .get_room_emojis(room_id, None)
                             .await
                             .map_or(0, |e| e.len());
 
