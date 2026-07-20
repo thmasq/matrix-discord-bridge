@@ -1617,22 +1617,83 @@ impl AppService {
     }
 
     fn process_matrix_text_for_discord(&self, body: &str, formatted_body: Option<&str>) -> String {
-        let process_source = formatted_body.unwrap_or(body);
+        let process_source = if let Some(html) = formatted_body {
+            static SPOILER_REGEX: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+            let spoiler_regex = SPOILER_REGEX.get_or_init(|| {
+                regex::Regex::new(r#"(?s)<span[^>]*data-mx-spoiler[^>]*>(.*?)</span>"#).unwrap()
+            });
+            let mut preprocessed = spoiler_regex
+                .replace_all(html, "\u{E000}$1\u{E001}")
+                .to_string();
 
-        let mention_regex = MENTION_REGEX
-            .get_or_init(|| regex::Regex::new(r"@_discord_(\d+)(?:-\d+)?:[\w.\-]+").unwrap());
+            static IMG_REGEX: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+            let img_regex =
+                IMG_REGEX.get_or_init(|| regex::Regex::new(r#"(?s)<img[^>]+>"#).unwrap());
 
-        let mentions_replaced = mention_regex.replace_all(process_source, "<@$1>");
+            static ALT_REGEX: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+            let alt_regex =
+                ALT_REGEX.get_or_init(|| regex::Regex::new(r#"alt="([^"]+)""#).unwrap());
 
-        let emote_regex = EMOTE_REGEX.get_or_init(|| regex::Regex::new(r":(\w+):").unwrap());
+            preprocessed = img_regex
+                .replace_all(&preprocessed, |caps: &regex::Captures| {
+                    let img_tag = caps[0].to_string();
+                    if img_tag.contains("data-mx-emoticon") {
+                        if let Some(alt_caps) = alt_regex.captures(&img_tag) {
+                            let mut alt = alt_caps[1].to_string();
+
+                            if !alt.starts_with(':') {
+                                alt = format!(":{alt}");
+                            }
+                            if !alt.ends_with(':') {
+                                alt = format!("{alt}:");
+                            }
+
+                            return alt;
+                        }
+                    }
+                    img_tag
+                })
+                .to_string();
+
+            let mut md = html2md::parse_html(&preprocessed);
+
+            md = md.replace('\u{E000}', "||").replace('\u{E001}', "||");
+            md
+        } else {
+            body.to_string()
+        };
+
+        let mention_regex = MENTION_REGEX.get_or_init(|| {
+                regex::Regex::new(r"(?s)(```.*?```|`.*?`)|\[[^\]]*\]\(https://matrix\.to/#/@_discord_(\d+)(?:-\d+)?:[\w.\-]+\)|@_discord_(\d+)(?:-\d+)?:[\w.\-]+").unwrap()
+            });
+
+        let mentions_replaced =
+            mention_regex.replace_all(&process_source, |caps: &regex::Captures| {
+                if let Some(code) = caps.get(1) {
+                    code.as_str().to_string()
+                } else if let Some(id) = caps.get(2).or_else(|| caps.get(3)) {
+                    format!("<@{}>", id.as_str())
+                } else {
+                    caps[0].to_string()
+                }
+            });
+
+        let emote_regex = EMOTE_REGEX
+            .get_or_init(|| regex::Regex::new(r"(?s)(```.*?```|`.*?`)|:(\w+):").unwrap());
 
         let mut processed_body = emote_regex
             .replace_all(&mentions_replaced, |caps: &regex::Captures| {
-                let name = &caps[1];
-                self.cache
-                    .d_emotes
-                    .get(name)
-                    .unwrap_or_else(|| caps[0].to_string())
+                if let Some(code) = caps.get(1) {
+                    code.as_str().to_string()
+                } else if let Some(emote_name) = caps.get(2) {
+                    let name = emote_name.as_str();
+                    self.cache
+                        .d_emotes
+                        .get(name)
+                        .unwrap_or_else(|| caps[0].to_string())
+                } else {
+                    caps[0].to_string()
+                }
             })
             .into_owned();
 

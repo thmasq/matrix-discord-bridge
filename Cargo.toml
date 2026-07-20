@@ -50,6 +50,7 @@ uuid = { version = "1.24.0", features = ["v4"] }
 # Markdown
 html-escape = "0.2.14"
 pulldown-cmark = "0.13.4"
+html2md = "0.2.15"
 
 [profile.release]
 opt-level = 3
