@@ -199,6 +199,10 @@ impl DiscordHandler {
         let mut embed_text = String::new();
 
         for embed in &message.embeds {
+            if embed.kind.as_deref() != Some("rich") {
+                continue;
+            }
+
             embed_text.push_str("\n\n---\n");
 
             if let Some(author) = &embed.author {
