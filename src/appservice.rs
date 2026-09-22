@@ -15,8 +15,9 @@ use hyper_util::rt::TokioIo;
 use serde_json::{Value, json};
 use sha2::Sha256;
 use std::collections::HashMap;
+use std::hash::{DefaultHasher, Hash};
 use std::sync::{Arc, OnceLock};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use tokio::{
     net::TcpListener,
     sync::{Mutex, mpsc},
@@ -26,13 +27,16 @@ type HmacSha256 = Hmac<Sha256>;
 
 const DISCORD_MESSAGE_LIMIT: usize = 2000;
 const MAX_BODY_SIZE: usize = 20 * 1024 * 1024; // 20 MB
+const MAX_WEBHOOK_POOL_SIZE: usize = 10;
 
 static MENTION_REGEX: OnceLock<regex::Regex> = OnceLock::new();
 static EMOTE_REGEX: OnceLock<regex::Regex> = OnceLock::new();
 static ID_REGEX: OnceLock<regex::Regex> = OnceLock::new();
 static HTML_REPLY_REGEX: OnceLock<regex::Regex> = OnceLock::new();
-static IMG_REGEX: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
-static ALT_REGEX: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+static IMG_REGEX: OnceLock<regex::Regex> = OnceLock::new();
+static ALT_REGEX: OnceLock<regex::Regex> = OnceLock::new();
+
+static WEBHOOK_LRU: OnceLock<Mutex<HashMap<String, Vec<(String, Instant)>>>> = OnceLock::new();
 
 pub struct AppService {
     config: Config,
@@ -437,7 +441,7 @@ impl AppService {
         );
 
         // Get webhook
-        let webhook = self.get_or_create_webhook(&channel_id).await?;
+        let webhook = self.get_or_create_webhook(&channel_id, sender).await?;
 
         // Determine filename from content or use default
         let info = content.get("info");
@@ -561,7 +565,7 @@ impl AppService {
             channel_id
         );
 
-        let webhook = self.get_or_create_webhook(channel_id).await?;
+        let webhook = self.get_or_create_webhook(channel_id, sender).await?;
 
         let discord_msg_id = self
             .send_webhook_message(
@@ -628,7 +632,7 @@ impl AppService {
             channel_id
         );
 
-        let webhook = self.get_or_create_webhook(channel_id).await?;
+        let webhook = self.get_or_create_webhook(channel_id, sender).await?;
 
         // Upload to Discord and send stream
         let discord_msg_id = self
@@ -653,7 +657,7 @@ impl AppService {
     async fn handle_message_edit(
         &self,
         room_id: &str,
-        _sender: &str,
+        sender: &str,
         new_event_id: &str,
         original_event_id: &str,
         content: &Value,
@@ -688,7 +692,7 @@ impl AppService {
         let channel_id = bridge.channel_id;
 
         // Get webhook
-        let webhook = self.get_or_create_webhook(&channel_id).await?;
+        let webhook = self.get_or_create_webhook(&channel_id, sender).await?;
 
         // Edit the message
         self.edit_webhook_message(&webhook, &discord_msg_id, &processed_body)
@@ -841,8 +845,12 @@ impl AppService {
 
         let discord_msg_id = mapped_val;
         let sender = event["sender"].as_str().unwrap();
+
+        let mut original_sender = sender.to_string();
+
         let is_mod_deletion =
             if let Ok(original_event) = self.matrix.get_event(room_id, redacts).await {
+                original_sender = original_event.sender.clone();
                 original_event.sender != sender
             } else {
                 tracing::debug!(
@@ -859,8 +867,10 @@ impl AppService {
 
         let channel_id = bridge.channel_id;
 
-        // Get webhook
-        let webhook = match self.get_or_create_webhook(&channel_id).await {
+        let webhook = match self
+            .get_or_create_webhook(&channel_id, &original_sender)
+            .await
+        {
             Ok(wh) => wh,
             Err(e) => {
                 tracing::error!("Failed to get webhook for channel {}: {}", channel_id, e);
@@ -1208,9 +1218,21 @@ impl AppService {
         Ok(())
     }
 
-    async fn get_or_create_webhook(&self, channel_id: &str) -> crate::error::Result<WebhookData> {
+    async fn get_or_create_webhook(
+        &self,
+        channel_id: &str,
+        sender: &str,
+    ) -> crate::error::Result<WebhookData> {
+        let mut hasher = DefaultHasher::new();
+        sender.hash(&mut hasher);
+
+        let index = get_lru_webhook_index(channel_id, sender).await;
+        let webhook_name = format!("matrix_bridge_{}", index);
+
+        let cache_key = format!("{}:{}", channel_id, webhook_name);
+
         // Check cache first
-        if let Some(info) = self.cache.d_webhooks.get(channel_id) {
+        if let Some(info) = self.cache.d_webhooks.get(&cache_key) {
             return Ok(WebhookData {
                 id: info.id.clone(),
                 token: info.token,
@@ -1246,10 +1268,10 @@ impl AppService {
             .await
             .map_err(|e| BridgeError::Matrix(format!("Failed to parse webhooks response: {e}")))?;
 
-        // Look for existing bridge webhook
+        // Look for existing bridge webhook matching this pooled name
         let existing = webhooks
             .iter()
-            .find(|w| w["name"].as_str() == Some("matrix_bridge"));
+            .find(|w| w["name"].as_str() == Some(&webhook_name));
 
         let webhook_data = if let Some(wh) = existing {
             WebhookData {
@@ -1257,10 +1279,10 @@ impl AppService {
                 token: wh["token"].as_str().unwrap().to_string(),
             }
         } else {
-            // Create new webhook
+            // Create new webhook with the pooled name
             let create_url = format!("https://discord.com/api/v10/channels/{channel_id}/webhooks");
-            let create_body = json!({
-                "name": "matrix_bridge"
+            let create_body = serde_json::json!({
+                "name": webhook_name
             });
 
             let response = self
@@ -1277,25 +1299,45 @@ impl AppService {
                 .map_err(|e| BridgeError::Matrix(format!("Failed to create webhook: {e}")))?;
 
             if !response.status().is_success() {
-                let error_text = response.text().await.unwrap_or_default();
-                return Err(BridgeError::Discord(Box::new(serenity::Error::from(
-                    std::io::Error::other(format!("Failed to create webhook: {error_text}")),
-                ))));
-            }
+                let fallback_wh = webhooks.iter().find(|w| {
+                    w["name"]
+                        .as_str()
+                        .unwrap_or("")
+                        .starts_with("matrix_bridge")
+                });
 
-            let webhook: Value = response.json().await.map_err(|e| {
-                BridgeError::Matrix(format!("Failed to parse webhook response: {e}"))
-            })?;
+                if let Some(wh) = fallback_wh {
+                    tracing::warn!(
+                        "Failed to create webhook {} (likely channel limit). Falling back to {}.",
+                        webhook_name,
+                        wh["name"].as_str().unwrap_or("unknown")
+                    );
 
-            WebhookData {
-                id: webhook["id"].as_str().unwrap().to_string(),
-                token: webhook["token"].as_str().unwrap().to_string(),
+                    WebhookData {
+                        id: wh["id"].as_str().unwrap().to_string(),
+                        token: wh["token"].as_str().unwrap().to_string(),
+                    }
+                } else {
+                    let error_text = response.text().await.unwrap_or_default();
+                    return Err(BridgeError::Discord(Box::new(serenity::Error::from(
+                        std::io::Error::other(format!("Failed to create webhook: {error_text}")),
+                    ))));
+                }
+            } else {
+                let webhook: Value = response.json().await.map_err(|e| {
+                    BridgeError::Matrix(format!("Failed to parse webhook response: {e}"))
+                })?;
+
+                WebhookData {
+                    id: webhook["id"].as_str().unwrap().to_string(),
+                    token: webhook["token"].as_str().unwrap().to_string(),
+                }
             }
         };
 
-        // Cache it
+        // Cache it using the composite key
         self.cache.d_webhooks.insert(
-            channel_id.to_string(),
+            cache_key,
             crate::cache::WebhookInfo {
                 id: webhook_data.id.clone(),
                 token: webhook_data.token.clone(),
@@ -1825,8 +1867,7 @@ impl AppService {
         let process_source = formatted_body.map_or_else(
             || body.to_string(),
             |html| {
-                static SPOILER_REGEX: std::sync::OnceLock<regex::Regex> =
-                    std::sync::OnceLock::new();
+                static SPOILER_REGEX: OnceLock<regex::Regex> = OnceLock::new();
                 let spoiler_regex = SPOILER_REGEX.get_or_init(|| {
                     regex::Regex::new(r"(?s)<span[^>]*data-mx-spoiler[^>]*>(.*?)</span>").unwrap()
                 });
@@ -1961,4 +2002,44 @@ impl AppService {
 
         (display_name, avatar_url)
     }
+}
+
+async fn get_lru_webhook_index(channel_id: &str, sender: &str) -> usize {
+    let lru_mutex = WEBHOOK_LRU.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut map = lru_mutex.lock().await;
+
+    // Get or initialize the webhook tracking pool for this specific channel
+    let pool = map
+        .entry(channel_id.to_string())
+        .or_insert_with(|| vec![(String::new(), std::time::Instant::now()); MAX_WEBHOOK_POOL_SIZE]);
+
+    let now = std::time::Instant::now();
+
+    // 1. Check if the user is already actively assigned to a webhook
+    for (i, slot) in pool.iter_mut().enumerate() {
+        if slot.0 == sender {
+            slot.1 = now; // Update their last-active time
+            return i;
+        }
+    }
+
+    // 2. User not found, so we find the least recently used slot
+    let mut oldest_idx = 0;
+    let mut oldest_time = now;
+
+    for (i, slot) in pool.iter().enumerate() {
+        if slot.0.is_empty() {
+            // If we find an empty slot, claim it immediately
+            oldest_idx = i;
+            break;
+        }
+        if slot.1 < oldest_time {
+            oldest_time = slot.1;
+            oldest_idx = i;
+        }
+    }
+
+    // 3. Reassign the oldest/empty slot to the new sender
+    pool[oldest_idx] = (sender.to_string(), now);
+    oldest_idx
 }
