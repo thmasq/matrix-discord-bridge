@@ -330,11 +330,13 @@ impl MatrixClient {
         let server_name = parts[0];
         let media_id = parts[1];
 
-        let exp = SystemTime::now()
+        let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
-            .as_secs()
-            + (86400 * 2); // 2 days
+            .as_secs();
+
+        let week_secs = 604_800;
+        let exp = (now / week_secs) * week_secs + (week_secs * 2);
 
         let exp_str = exp.to_string();
 
