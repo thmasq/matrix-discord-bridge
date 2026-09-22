@@ -72,6 +72,21 @@ impl DiscordHandler {
         user.discriminator.map_or(0, std::num::NonZero::get)
     }
 
+    fn resolve_display_name(user: &serenity::model::user::User, nick: Option<&str>) -> String {
+        if let Some(n) = nick {
+            return n.to_string();
+        }
+        if let Some(g) = &user.global_name {
+            return g.to_string();
+        }
+        let discriminator = Self::get_discriminator(user);
+        if discriminator == 0 {
+            user.name.clone()
+        } else {
+            format!("{}#{:04}", user.name, discriminator)
+        }
+    }
+
     fn process_discord_message(&self, message: &Message) -> (String, HashMap<String, String>) {
         let mut content = message.content.clone();
         let mut emotes = HashMap::new();
@@ -225,32 +240,21 @@ impl DiscordHandler {
     async fn sync_profile(
         &self,
         user_id: DiscordUserId,
-        username: &str,
-        discriminator: u16,
+        display_name: &str,
         avatar_url: &str,
         hashed: Option<&str>,
     ) -> crate::error::Result<()> {
         let mxid = self.matrix.matrixify_user(&user_id.to_string(), hashed);
 
-        // Check if user exists and fetch their current profile
         let Some(profile) = self.db.fetch_user(&mxid).await? else {
-            // User doesn't exist yet, will be created on first message
             return Ok(());
-        };
-
-        let display_name = if discriminator == 0 {
-            // New username system (no discriminator)
-            username.to_string()
-        } else {
-            // Legacy username system
-            format!("{username}#{discriminator:04}")
         };
 
         let mut updated = false;
 
         // Update display name if changed
-        if profile.username.as_deref() != Some(&display_name) {
-            match self.matrix.set_display_name(&mxid, &display_name).await {
+        if profile.username.as_deref() != Some(display_name) {
+            match self.matrix.set_display_name(&mxid, display_name).await {
                 Ok(()) => {
                     tracing::info!("Updated display name for {} to {}", mxid, display_name);
                     updated = true;
@@ -308,13 +312,10 @@ impl DiscordHandler {
             tracing::info!("Registering new puppet user: {}", mxid);
             self.matrix.register_user(&mxid).await?;
 
-            let discriminator = Self::get_discriminator(&message.author);
-
-            let display_name = if discriminator == 0 {
-                message.author.name.clone()
-            } else {
-                format!("{}#{:04}", message.author.name, discriminator)
-            };
+            let display_name = Self::resolve_display_name(
+                &message.author,
+                message.member.as_ref().and_then(|m| m.nick.as_deref()),
+            );
 
             self.matrix.set_display_name(&mxid, &display_name).await?;
 
@@ -323,17 +324,13 @@ impl DiscordHandler {
                 tracing::warn!("Failed to set avatar for {}: {}", mxid, e);
             }
         } else if message.webhook_id.is_some() {
-            // For webhook messages, always sync profile
-            let discriminator = Self::get_discriminator(&message.author);
+            let display_name = Self::resolve_display_name(
+                &message.author,
+                message.member.as_ref().and_then(|m| m.nick.as_deref()),
+            );
             let avatar = message.author.face();
             let _ = self
-                .sync_profile(
-                    message.author.id,
-                    &message.author.name,
-                    discriminator,
-                    &avatar,
-                    hashed.as_deref(),
-                )
+                .sync_profile(message.author.id, &display_name, &avatar, hashed.as_deref())
                 .await;
         }
 
@@ -682,11 +679,11 @@ impl EventHandler for DiscordHandler {
         );
 
         for (user_id, member) in guild.members {
-            let discriminator = Self::get_discriminator(&member.user);
+            let display_name = Self::resolve_display_name(&member.user, member.nick.as_deref());
             let avatar = member.user.face();
 
             if let Err(e) = self
-                .sync_profile(user_id, &member.user.name, discriminator, &avatar, None)
+                .sync_profile(user_id, &display_name, &avatar, None)
                 .await
             {
                 tracing::debug!("Failed to sync profile for {}: {}", user_id, e);
@@ -714,19 +711,13 @@ impl EventHandler for DiscordHandler {
     ) {
         let Some(member) = new else { return };
 
-        let discriminator = Self::get_discriminator(&member.user);
+        let display_name = Self::resolve_display_name(&member.user, member.nick.as_deref());
         let avatar = member.user.face();
 
-        tracing::info!("Member profile updated: {}", member.user.name);
+        tracing::info!("Member profile updated: {}", display_name);
 
         if let Err(e) = self
-            .sync_profile(
-                member.user.id,
-                &member.user.name,
-                discriminator,
-                &avatar,
-                None,
-            )
+            .sync_profile(member.user.id, &display_name, &avatar, None)
             .await
         {
             tracing::error!(
