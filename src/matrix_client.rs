@@ -29,6 +29,7 @@ static SHORTCODE_REGEX: OnceLock<regex::Regex> = OnceLock::new();
 pub struct MatrixClient {
     config: Config,
     http_client: Client<hyper_tls::HttpsConnector<HttpConnector>, Full<Bytes>>,
+    reqwest_client: reqwest::Client,
     db: Database,
     cache: Cache,
 }
@@ -49,10 +50,15 @@ impl MatrixClient {
     pub fn new(config: Config, db: Database, cache: Cache) -> Self {
         let https = hyper_tls::HttpsConnector::new();
         let http_client = Client::builder(hyper_util::rt::TokioExecutor::new()).build(https);
+        let reqwest_client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(60))
+            .build()
+            .unwrap();
 
         Self {
             config,
             http_client,
+            reqwest_client,
             db,
             cache,
         }
@@ -666,13 +672,20 @@ impl MatrixClient {
             ));
         }
 
-        let http_client = reqwest::Client::new();
+        let res = self
+            .reqwest_client
+            .get(&attachment.url)
+            .send()
+            .await
+            .map_err(|e| {
+                BridgeError::Matrix(format!("Failed to fetch attachment from Discord: {e}"))
+            })?;
 
-        let res = http_client.get(&attachment.url).send().await.map_err(|e| {
-            BridgeError::Matrix(format!("Failed to fetch attachment from Discord: {e}"))
+        let file_body = res.bytes().await.map_err(|e| {
+            BridgeError::Matrix(format!("Failed to read attachment from Discord: {e}"))
         })?;
 
-        let file_body = reqwest::Body::wrap_stream(res.bytes_stream());
+        let actual_size = file_body.len();
 
         let upload_url = format!("{}/_matrix/media/v3/upload", self.config.homeserver);
 
@@ -681,11 +694,12 @@ impl MatrixClient {
             .as_deref()
             .unwrap_or("application/octet-stream");
 
-        let upload_res = http_client
+        let upload_res = self
+            .reqwest_client
             .post(&upload_url)
             .header("Authorization", format!("Bearer {}", self.config.as_token))
             .header("Content-Type", content_type)
-            .header("Content-Length", attachment.size.to_string())
+            .header("Content-Length", actual_size.to_string())
             .body(file_body)
             .send()
             .await
@@ -706,8 +720,7 @@ impl MatrixClient {
         let mxc_url = upload_resp["content_uri"].as_str().unwrap();
 
         // Determine message type based on content type
-        let (msgtype, extra_info) =
-            Self::determine_media_type(attachment, mxc_url, attachment.size as usize);
+        let (msgtype, extra_info) = Self::determine_media_type(attachment, mxc_url, actual_size);
 
         let mut content = json!({
             "msgtype": msgtype,
