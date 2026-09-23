@@ -1,6 +1,6 @@
 [package]
 name = "matrix-discord-bridge"
-version = "1.0.2"
+version = "1.0.3"
 authors = ["Thomas Q <thmasqsa@gmail.com>"]
 edition = "2024"
 license = "AGPL-3.0-only"
