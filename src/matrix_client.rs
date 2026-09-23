@@ -112,8 +112,10 @@ impl MatrixClient {
                 .get("error")
                 .and_then(|v| v.as_str())
                 .unwrap_or("Unknown error");
-            tracing::error!("Matrix API error ({}): {} - {}", status, errcode, error);
-            return Err(BridgeError::Matrix(format!("HTTP {status}: {error}")));
+
+            return Err(BridgeError::Matrix(format!(
+                "HTTP {status} ({errcode}): {error}"
+            )));
         }
 
         Ok(json)
@@ -933,22 +935,25 @@ impl MatrixClient {
                             }
                         }
                     }
-                    Err(e) => tracing::warn!(
-                        "Failed to fetch state from space {}. Is the bot invited to the space? Error: {}",
+                    Err(e) => tracing::debug!(
+                        "Could not fetch state from space {}. Skipping space emojis. Reason: {}",
                         parent_room_id,
                         e
                     ),
                     _ => {
-                        tracing::warn!("Space {} returned an invalid state format", parent_room_id);
+                        tracing::debug!(
+                            "Space {} returned an invalid state format",
+                            parent_room_id
+                        );
                     }
                 }
             }
         } else {
-            tracing::warn!("Failed to fetch or parse state array for room {}", room_id);
+            tracing::debug!("Failed to fetch or parse state array for room {}", room_id);
         }
 
         if emojis.is_empty() {
-            tracing::warn!(
+            tracing::debug!(
                 "Finished scanning, but found ZERO emojis for room {}",
                 room_id
             );
@@ -1272,7 +1277,7 @@ impl MatrixClient {
         let closest_event_id = if let Ok(r) = ts_resp {
             r["event_id"].as_str().map(String::from)
         } else {
-            tracing::warn!("MSC3030 request failed. Is the homeserver up to date?");
+            tracing::debug!("MSC3030 request failed. Is the homeserver up to date?");
             return Ok(None);
         };
 
