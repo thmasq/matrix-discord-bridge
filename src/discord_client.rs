@@ -248,11 +248,11 @@ impl DiscordHandler {
         display_name: &str,
         avatar_url: &str,
         hashed: Option<&str>,
-    ) -> crate::error::Result<()> {
+    ) -> crate::error::Result<bool> {
         let mxid = self.matrix.matrixify_user(&user_id.to_string(), hashed);
 
         let Some(profile) = self.db.fetch_user(&mxid).await? else {
-            return Ok(());
+            return Ok(false);
         };
 
         let mut updated = false;
@@ -287,7 +287,7 @@ impl DiscordHandler {
             tracing::debug!("Profile sync completed for {}", mxid);
         }
 
-        Ok(())
+        Ok(updated)
     }
 
     async fn ensure_user_in_room(
@@ -311,6 +311,7 @@ impl DiscordHandler {
 
         // Check if user exists in database
         let user_exists = self.db.fetch_user(&mxid).await?.is_some();
+        let profile_updated: bool;
 
         if !user_exists {
             // Register the user
@@ -328,15 +329,17 @@ impl DiscordHandler {
             if let Err(e) = self.matrix.set_avatar(&mxid, &avatar).await {
                 tracing::warn!("Failed to set avatar for {}: {}", mxid, e);
             }
+            profile_updated = true;
         } else {
             let display_name = Self::resolve_display_name(
                 &message.author,
                 message.member.as_ref().and_then(|m| m.nick.as_deref()),
             );
             let avatar = message.author.face();
-            let _ = self
+            profile_updated = self
                 .sync_profile(message.author.id, &display_name, &avatar, hashed.as_deref())
-                .await;
+                .await
+                .unwrap_or(false);
         }
 
         // Check if user is already in the room
@@ -348,6 +351,10 @@ impl DiscordHandler {
 
         if is_in_room {
             tracing::debug!("User {} already in room {}", mxid, room_id);
+            if profile_updated {
+                tracing::debug!("Forcing room profile sync for {}", mxid);
+                let _ = self.matrix.join_room(room_id, Some(&mxid)).await;
+            }
         } else {
             // User not in room, invite and join
             if let Err(e) = self.matrix.send_invite(room_id, &mxid).await {
