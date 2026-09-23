@@ -95,8 +95,9 @@ impl DiscordHandler {
         for user in &message.mentions {
             let mention = format!("<@{}>", user.id);
             let mention_nick = format!("<@!{}>", user.id);
-            content = content.replace(&mention, &format!("@{}", user.name));
-            content = content.replace(&mention_nick, &format!("@{}", user.name));
+            let display_name = Self::resolve_display_name(user, None);
+            content = content.replace(&mention, &format!("@{}", display_name));
+            content = content.replace(&mention_nick, &format!("@{}", display_name));
         }
 
         // Process role mentions: <@&123456> -> @role-name
@@ -327,7 +328,7 @@ impl DiscordHandler {
             if let Err(e) = self.matrix.set_avatar(&mxid, &avatar).await {
                 tracing::warn!("Failed to set avatar for {}: {}", mxid, e);
             }
-        } else if message.webhook_id.is_some() {
+        } else {
             let display_name = Self::resolve_display_name(
                 &message.author,
                 message.member.as_ref().and_then(|m| m.nick.as_deref()),
