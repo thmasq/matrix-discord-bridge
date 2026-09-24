@@ -777,28 +777,7 @@ impl AppService {
                 let discord_emoji = parts[3];
                 let reaction_key = parts[4];
 
-                let count_key = format!("reaction_count|{target_event_id}|{reaction_key}");
-                let cached_count: Option<u32> = self
-                    .cache
-                    .m_messages
-                    .get(&count_key)
-                    .and_then(|v| v.parse().ok());
-
-                if let Some(count) = cached_count
-                    && count > 1
-                {
-                    tracing::debug!(
-                        "Fast path: Decrementing cached reaction count (now {})",
-                        count - 1
-                    );
-                    self.cache
-                        .m_messages
-                        .insert(count_key, (count - 1).to_string());
-                    self.cache.m_messages.invalidate(redacts);
-                    return Ok(());
-                }
-
-                tracing::debug!("Slow path: Querying Matrix API for remaining reactions");
+                tracing::debug!("Querying Matrix API for remaining reactions");
                 let mut active = 0;
                 if let Ok(reactions) = self.matrix.get_reactions(room_id, target_event_id).await {
                     for r in reactions {
@@ -810,12 +789,16 @@ impl AppService {
                             && let Some(key) = rel.get("key").and_then(|k| k.as_str())
                             && key == reaction_key
                         {
-                            active += 1;
+                            let r_sender = r.get("sender").and_then(|s| s.as_str()).unwrap_or("");
+
+                            if !r_sender.starts_with("@_discord_")
+                                && r_sender != self.config.full_user_id()
+                            {
+                                active += 1;
+                            }
                         }
                     }
                 }
-
-                self.cache.m_messages.insert(count_key, active.to_string());
 
                 if active == 0 {
                     tracing::info!(
@@ -1139,17 +1122,6 @@ impl AppService {
                 std::io::Error::other(format!("Discord reaction failed: {status}")),
             ))));
         }
-
-        let count_key = format!("reaction_count|{target_event_id}|{reaction_key}");
-        let count: u32 = self
-            .cache
-            .m_messages
-            .get(&count_key)
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(0);
-        self.cache
-            .m_messages
-            .insert(count_key, (count + 1).to_string());
 
         let cache_key =
             format!("reaction|{discord_msg_id}|{target_event_id}|{discord_emoji}|{reaction_key}");
